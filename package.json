@@ -14,7 +14,8 @@
   "files": [
     "dist",
     "README.md",
-    "README.zh-CN.md"
+    "README.zh-CN.md",
+    "docs"
   ],
   "scripts": {
     "build": "rm -rf dist && tsc",
