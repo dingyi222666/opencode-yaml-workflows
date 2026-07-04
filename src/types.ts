@@ -1,3 +1,5 @@
+import type { createOpencodeClient } from "@opencode-ai/sdk"
+
 export type WorkflowInputDefinition = {
   type?: "string" | "number" | "boolean" | "object" | "array"
   required?: boolean
@@ -94,17 +96,10 @@ export type WorkflowRegistry = {
   byID: Map<string, WorkflowSource>
 }
 
-export type SessionClient = {
-  create(input?: Record<string, unknown>): Promise<unknown>
-  prompt?(input: Record<string, unknown>): Promise<unknown>
-  promptAsync?(input: Record<string, unknown>): Promise<unknown>
-  wait?(input: Record<string, unknown>): Promise<unknown>
-  messages?(input: Record<string, unknown>): Promise<unknown>
-  abort?(input: Record<string, unknown>): Promise<unknown>
-}
-
 export type OpencodeClient = {
-  session: SessionClient
+  session: ReturnType<typeof createOpencodeClient>["session"] & {
+    wait?(input: Record<string, unknown>): Promise<unknown>
+  }
 }
 
 export type RuntimeContext = {

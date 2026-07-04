@@ -1,7 +1,15 @@
 import { createRunID, loadRun, saveRun } from "./persistence.js"
 import { renderTemplate, resolveStepSettings } from "./parser.js"
-import { createSessionInput, promptSessionInput, sessionPathInput } from "./sdk.js"
 import type { RuntimeContext, ToolRuntimeContext, Workflow, WorkflowRun, WorkflowStep } from "./types.js"
+import type { createOpencodeClient } from "@opencode-ai/sdk"
+
+type SDKSession = ReturnType<typeof createOpencodeClient>["session"]
+type SessionAbortInput = Parameters<SDKSession["abort"]>[0]
+type SessionCreateInput = NonNullable<Parameters<SDKSession["create"]>[0]>
+type SessionMessagesInput = Parameters<SDKSession["messages"]>[0]
+type SessionPromptInput = Parameters<SDKSession["prompt"]>[0]
+type SessionPromptAsyncInput = Parameters<SDKSession["promptAsync"]>[0]
+type SessionPromptBody = NonNullable<SessionPromptInput["body"]>
 
 const activeRuns = new Map<string, { cancelled: boolean }>()
 
@@ -75,7 +83,10 @@ export async function cancelWorkflow(runtime: RuntimeContext, runID: string) {
   run.status = "cancelled"
   logRun(run, "Workflow run cancelled", { runID })
   for (const child of Object.values(run.childSessions)) {
-    if (child.status === "running") await runtime.client.session.abort?.(sessionPathInput(child.sessionID, runtime.directory)).catch(() => undefined)
+    if (child.status === "running") {
+      const abortInput: SessionAbortInput = { path: { id: child.sessionID }, query: runtime.directory ? { directory: runtime.directory } : undefined }
+      await runtime.client.session.abort?.(abortInput).catch(() => undefined)
+    }
     child.status = child.status === "completed" ? child.status : "cancelled"
   }
   await saveRun(runtime.worktree, run)
@@ -141,7 +152,7 @@ async function executePromptStep(
   const settings = resolveStepSettings(workflow.defaults, step)
   const model = settings.model ? parseModel(settings.model) : undefined
   const prompt = buildStepPrompt(step, settings, run.inputs, state)
-  if (run.async && runtime.client.session.prompt) {
+  if (run.async) {
     try {
       await executeSubtaskStep(runtime, tool, workflow, run, step, state, prompt, settings.agent ?? tool.agent ?? "general", model)
       return
@@ -155,7 +166,10 @@ async function executePromptStep(
     }
   }
 
-  const createInput = createSessionInput(run.parentSessionID, `workflow:${workflow.id}/${step.id}`, tool.directory)
+  const createInput: SessionCreateInput = {
+    body: { parentID: run.parentSessionID, title: `workflow:${workflow.id}/${step.id}` },
+    query: tool.directory ? { directory: tool.directory } : undefined,
+  }
   logRun(run, "Creating direct child session", { stepID: step.id, createInput })
   const session = await runtime.client.session.create(createInput).catch((error) => {
     throw new Error(`Failed to create child session for step ${step.id}.\nCreate input:\n${safeJson(createInput)}\nError:\n${formatUnknownError(error)}`)
@@ -174,15 +188,16 @@ async function executePromptStep(
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "running" }
   await saveRun(runtime.worktree, run)
 
-  const promptBody: Record<string, unknown> = { parts: [{ type: "text", text: prompt }] }
+  const promptBody: SessionPromptBody = { parts: [{ type: "text", text: prompt }] }
   if (settings.agent) promptBody.agent = settings.agent
   if (model) promptBody.model = model
   if (Object.keys(settings.tools).length > 0) promptBody.tools = settings.tools
   if (settings.system) promptBody.system = settings.system
-  const promptInput = promptSessionInput(sessionID, promptBody, tool.directory)
+  const promptInput: SessionPromptInput = { path: { id: sessionID }, body: promptBody, query: tool.directory ? { directory: tool.directory } : undefined }
   logRun(run, "Prompting direct child session", { stepID: step.id, promptInput })
-  const promptMethod = run.async && runtime.client.session.promptAsync ? runtime.client.session.promptAsync.bind(runtime.client.session) : runtime.client.session.prompt?.bind(runtime.client.session)
-  const promptResult = await promptMethod?.(promptInput)
+  const promptResult = run.async && runtime.client.session.promptAsync
+    ? await runtime.client.session.promptAsync(promptInput as SessionPromptAsyncInput)
+    : await runtime.client.session.prompt?.(promptInput)
   const promptEnvelopeError = formatSDKEnvelopeError(promptResult)
   if (promptEnvelopeError) {
     throw new Error(`Failed to prompt child session for step ${step.id}.\nPrompt input:\n${safeJson(promptInput)}\n${promptEnvelopeError}`)
@@ -218,7 +233,11 @@ async function executeSubtaskStep(
   run.childSessions[step.id] = { stepID: step.id, sessionID: "pending", status: "running" }
   await saveRun(runtime.worktree, run)
 
-  const parentPromptInput = promptSessionInput(run.parentSessionID, { parts: [subtaskPart] }, tool.directory)
+  const parentPromptInput: SessionPromptInput = {
+    path: { id: run.parentSessionID },
+    body: { parts: [subtaskPart as SessionPromptBody["parts"][number]] },
+    query: tool.directory ? { directory: tool.directory } : undefined,
+  }
   logRun(run, "Submitting subtask part to parent session", { stepID: step.id, parentPromptInput })
   const result = await runtime.client.session.prompt?.(parentPromptInput).catch((error) => {
     throw new Error(`Failed to submit subtask part for step ${step.id}.\nPrompt input:\n${safeJson(parentPromptInput)}\nError:\n${formatUnknownError(error)}`)
@@ -253,15 +272,21 @@ function buildStepPrompt(step: WorkflowStep, settings: ReturnType<typeof resolve
 }
 
 async function readSessionOutput(runtime: RuntimeContext, sessionID: string, directory?: string) {
-  const messages = await runtime.client.session.messages?.(sessionPathInput(sessionID, directory)).catch(() => undefined)
+  const messagesInput: SessionMessagesInput = { path: { id: sessionID }, query: directory ? { directory } : undefined }
+  const messages = await runtime.client.session.messages?.(messagesInput).catch(() => undefined)
   return extractText(messages)
 }
 
 async function wakeParent(runtime: RuntimeContext, run: WorkflowRun) {
   const summary = run.status === "completed" ? run.result || "Workflow completed." : `Workflow ${run.status}: ${run.error ?? "No details."}`
   const logs = run.logs?.length ? `\n\nWorkflow logs:\n${run.logs.slice(-30).join("\n")}` : ""
+  const wakeInput: SessionPromptInput = {
+    path: { id: run.parentSessionID },
+    body: { noReply: false, parts: [{ type: "text", synthetic: true, text: `[workflow:${run.workflowID}] run ${run.id} ${run.status}\n\n${summary}${logs}` }] },
+    query: runtime.directory ? { directory: runtime.directory } : undefined,
+  }
   await runtime.client.session
-    .prompt?.(promptSessionInput(run.parentSessionID, { noReply: false, parts: [{ type: "text", synthetic: true, text: `[workflow:${run.workflowID}] run ${run.id} ${run.status}\n\n${summary}${logs}` }] }, runtime.directory))
+    .prompt?.(wakeInput)
     .catch(() => undefined)
 }
 

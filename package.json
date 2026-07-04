@@ -1,6 +1,6 @@
 {
   "name": "opencode-yaml-workflows",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "YAML workflow plugin for opencode child-session subagents",
   "type": "module",
   "main": "dist/index.js",
@@ -17,7 +17,7 @@
     "README.zh-CN.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && tsc",
     "check": "tsc --noEmit",
     "test": "bun test",
     "prepack": "npm run build",

@@ -6,6 +6,15 @@ import { parseWorkflowYaml } from "../src/parser.js"
 import { loadRun } from "../src/persistence.js"
 import { runWorkflow } from "../src/runner.js"
 import type { RuntimeContext, ToolRuntimeContext } from "../src/types.js"
+import type { OpencodeClient } from "@opencode-ai/sdk"
+
+type TestSessionClient = Partial<Record<keyof OpencodeClient["session"], (...args: any[]) => any>> & {
+  wait?: (input: Record<string, unknown>) => Promise<unknown>
+}
+
+function testRuntime(root: string, session: TestSessionClient): RuntimeContext {
+  return { directory: root, worktree: root, client: { session: session as RuntimeContext["client"]["session"] } }
+}
 
 const yaml = `
 id: run-me
@@ -33,11 +42,7 @@ describe("workflow runner", () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
     const creates: unknown[] = []
     const prompts: unknown[] = []
-    const runtime: RuntimeContext = {
-      directory: root,
-      worktree: root,
-      client: {
-        session: {
+    const runtime = testRuntime(root, {
           create: async (input) => {
             creates.push(input)
             return { id: "child-1" }
@@ -48,9 +53,7 @@ describe("workflow runner", () => {
           },
           wait: async () => undefined,
           messages: async () => ({ data: [{ parts: [{ text: "child output" }] }] }),
-        },
-      },
-    }
+        })
     const tool: ToolRuntimeContext = { sessionID: "parent-1", directory: root, worktree: root }
     try {
       const run = await runWorkflow({ runtime, tool, workflow: parseWorkflowYaml(yaml), inputs: { name: "task" }, async: false })
@@ -69,11 +72,7 @@ describe("workflow runner", () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
     const prompts: unknown[] = []
     const creates: unknown[] = []
-    const runtime: RuntimeContext = {
-      directory: root,
-      worktree: root,
-      client: {
-        session: {
+    const runtime = testRuntime(root, {
           create: async (input) => {
             creates.push(input)
             return { id: "child-1" }
@@ -85,9 +84,7 @@ describe("workflow runner", () => {
               : {}
           },
           messages: async () => ({ data: [{ parts: [{ text: "async output" }] }] }),
-        },
-      },
-    }
+        })
     const tool: ToolRuntimeContext = { sessionID: "parent-1", directory: root, worktree: root }
     try {
       const run = await runWorkflow({ runtime, tool, workflow: parseWorkflowYaml(yaml), inputs: {} })
@@ -107,20 +104,14 @@ describe("workflow runner", () => {
   test("sync execution keeps direct child-session fallback", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
     const creates: unknown[] = []
-    const runtime: RuntimeContext = {
-      directory: root,
-      worktree: root,
-      client: {
-        session: {
+    const runtime = testRuntime(root, {
           create: async (input) => {
             creates.push(input)
             return { id: "child-1" }
           },
           prompt: async () => ({ data: { parts: [{ text: "ok" }] } }),
           messages: async () => ({ data: [{ parts: [{ text: "ok" }] }] }),
-        },
-      },
-    }
+        })
     try {
       await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: false })
       expect(creates[0]).toMatchObject({ body: { parentID: "parent-1" }, query: { directory: root } })
@@ -131,7 +122,7 @@ describe("workflow runner", () => {
 
   test("fails fast without parent session", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
-    const runtime: RuntimeContext = { directory: root, worktree: root, client: { session: { create: async () => ({ id: "x" }) } } }
+    const runtime = testRuntime(root, { create: async () => ({ id: "x" }) })
     try {
       await expect(runWorkflow({ runtime, tool: { sessionID: "", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {} })).rejects.toThrow("parent sessionID")
     } finally {
@@ -142,20 +133,14 @@ describe("workflow runner", () => {
   test("omits tool overrides when tools are not configured", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
     const prompts: unknown[] = []
-    const runtime: RuntimeContext = {
-      directory: root,
-      worktree: root,
-      client: {
-        session: {
+    const runtime = testRuntime(root, {
           create: async () => ({ id: "child-1" }),
           prompt: async (input) => {
             prompts.push(input)
             return { data: { parts: [{ text: "ok" }] } }
           },
           messages: async () => ({ data: [{ parts: [{ text: "ok" }] }] }),
-        },
-      },
-    }
+        })
     const noToolsYaml = `
 id: no-tools
 steps:
@@ -172,16 +157,10 @@ steps:
 
   test("records detailed child session creation failures", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
-    const runtime: RuntimeContext = {
-      directory: root,
-      worktree: root,
-      client: {
-        session: {
+    const runtime = testRuntime(root, {
           create: async () => ({ error: { code: "NO_AGENT", message: "agent not found" } }),
           prompt: async () => ({ data: { parts: [{ text: "unused" }] } }),
-        },
-      },
-    }
+        })
     try {
       const run = await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: false })
       expect(run.status).toBe("failed")
@@ -197,16 +176,10 @@ steps:
 
   test("does not mark subtask SDK error envelopes as completed", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
-    const runtime: RuntimeContext = {
-      directory: root,
-      worktree: root,
-      client: {
-        session: {
+    const runtime = testRuntime(root, {
           create: async () => ({ id: "should-not-fallback" }),
           prompt: async () => ({ error: { code: "SESSION_BUSY", message: "session is busy" }, request: { timeout: false }, response: { status: 409 } }),
-        },
-      },
-    }
+        })
     try {
       const run = await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: true })
       expect(run.async).toBe(true)

@@ -4,8 +4,14 @@ import { parseWorkflowYaml } from "./parser.js"
 import { loadRun, saveWorkflow } from "./persistence.js"
 import { cancelWorkflow, runWorkflow, statusWorkflow } from "./runner.js"
 import { WORKFLOW_SCHEMA_TEXT } from "./schema.js"
-import { createSessionInput, promptSessionInput, sessionPathInput } from "./sdk.js"
 import type { RuntimeContext, ToolRuntimeContext, Workflow } from "./types.js"
+import type { createOpencodeClient } from "@opencode-ai/sdk"
+
+type SDKSession = ReturnType<typeof createOpencodeClient>["session"]
+type SessionCreateInput = NonNullable<Parameters<SDKSession["create"]>[0]>
+type SessionMessagesInput = Parameters<SDKSession["messages"]>[0]
+type SessionPromptInput = Parameters<SDKSession["prompt"]>[0]
+type SessionPromptBody = NonNullable<SessionPromptInput["body"]>
 
 const z = tool.schema
 
@@ -108,17 +114,20 @@ async function resolveWorkflow(runtime: RuntimeContext, context: ToolRuntimeCont
 async function generateWorkflow(runtime: RuntimeContext, context: ToolRuntimeContext, args: { goal: string; agent?: string; model?: string; skills?: string[]; tools?: Record<string, boolean>; saveAs?: string }) {
   if (!context.sessionID) throw new Error("workflow_generate requires a current parent sessionID")
   const model = args.model ? parseModel(args.model) : undefined
-  const session = await runtime.client.session.create(createSessionInput(context.sessionID, "workflow:generate", context.directory))
+  const createInput: SessionCreateInput = { body: { parentID: context.sessionID, title: "workflow:generate" }, query: context.directory ? { directory: context.directory } : undefined }
+  const session = await runtime.client.session.create(createInput)
   const sessionID = extractSessionID(session)
   if (!sessionID) throw new Error("Failed to create workflow generation child session")
   const prompt = `Create a valid YAML workflow for this goal. Return only YAML. Goal: ${args.goal}\nSkills: ${(args.skills ?? []).join(", ")}\n\n${WORKFLOW_SCHEMA_TEXT}`
-  const promptBody: Record<string, unknown> = { parts: [{ type: "text", text: prompt }] }
+  const promptBody: SessionPromptBody = { parts: [{ type: "text", text: prompt }] }
   if (args.agent) promptBody.agent = args.agent
   if (model) promptBody.model = model
   if (args.tools) promptBody.tools = args.tools
-  const result = await (runtime.client.session.prompt?.(promptSessionInput(sessionID, promptBody, context.directory)) ?? Promise.resolve(undefined))
+  const promptInput: SessionPromptInput = { path: { id: sessionID }, body: promptBody, query: context.directory ? { directory: context.directory } : undefined }
+  const result = await (runtime.client.session.prompt?.(promptInput) ?? Promise.resolve(undefined))
   await runtime.client.session.wait?.({ sessionID }).catch(() => undefined)
-  const text = extractText(await runtime.client.session.messages?.(sessionPathInput(sessionID, context.directory)).catch(() => undefined)) || extractText(result) || ""
+  const messagesInput: SessionMessagesInput = { path: { id: sessionID }, query: context.directory ? { directory: context.directory } : undefined }
+  const text = extractText(await runtime.client.session.messages?.(messagesInput).catch(() => undefined)) || extractText(result) || ""
   const yaml = stripFences(text)
   const workflow = parseWorkflowYaml(yaml)
   if (args.saveAs) await saveWorkflow({ worktree: context.worktree, workflow, location: "project", saveAs: args.saveAs })
