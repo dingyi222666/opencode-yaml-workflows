@@ -220,43 +220,42 @@ async function executeSubtaskStep(
   agent: string,
   model?: { providerID: string; modelID: string },
 ) {
-  const description = `workflow:${workflow.id}/${step.id}`
-  const subtaskPart: Record<string, unknown> = {
-    type: "subtask",
-    agent,
-    description,
-    command: "workflow",
-    prompt,
+  if (!runtime.v2Client) {
+    throw new Error("Native subtask execution requires @opencode-ai/sdk/v2 client support.")
   }
-  if (model) subtaskPart.model = model
+  const description = `workflow:${workflow.id}/${step.id}`
 
   run.childSessions[step.id] = { stepID: step.id, sessionID: "pending", status: "running" }
   await saveRun(runtime.worktree, run)
 
-  const parentPromptInput: SessionPromptInput = {
-    path: { id: run.parentSessionID },
-    body: { parts: [subtaskPart as SessionPromptBody["parts"][number]] },
-    query: tool.directory ? { directory: tool.directory } : undefined,
+  const promptText = [
+    `Run workflow step ${description} as native subtask handling.`,
+    `Use agent: ${agent}.`,
+    model ? `Use model: ${model.providerID}/${model.modelID}.` : undefined,
+    "Prompt:",
+    prompt,
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+  const parentPromptInput = {
+    sessionID: run.parentSessionID,
+    prompt: { text: promptText, agents: [{ name: agent }] },
+    delivery: "queue" as const,
   }
-  logRun(run, "Submitting subtask part to parent session", { stepID: step.id, parentPromptInput })
-  const result = await runtime.client.session.prompt?.(parentPromptInput).catch((error) => {
-    throw new Error(`Failed to submit subtask part for step ${step.id}.\nPrompt input:\n${safeJson(parentPromptInput)}\nError:\n${formatUnknownError(error)}`)
+  logRun(run, "Submitting v2 native subtask prompt to parent session", { stepID: step.id, parentPromptInput })
+  const result = await runtime.v2Client.session.prompt(parentPromptInput).catch((error) => {
+    throw new Error(`Failed to submit v2 native subtask prompt for step ${step.id}.\nPrompt input:\n${safeJson(parentPromptInput)}\nError:\n${formatUnknownError(error)}`)
   })
   const envelopeError = formatSDKEnvelopeError(result)
   if (envelopeError) {
-    throw new Error(`Failed to submit subtask part for step ${step.id}.\nPrompt input:\n${safeJson(parentPromptInput)}\n${envelopeError}`)
+    throw new Error(`Failed to submit v2 native subtask prompt for step ${step.id}.\nPrompt input:\n${safeJson(parentPromptInput)}\n${envelopeError}`)
   }
-  const sessionID = extractTaskSessionID(result) ?? "unknown"
-  const output = extractTaskOutput(result) || extractText(result) || ""
-  if (sessionID === "unknown" && !output) {
-    throw new Error(
-      `Subtask submission for step ${step.id} returned no child session id and no output.\nPrompt input:\n${safeJson(parentPromptInput)}\nRaw response:\n${safeJson(result)}`,
-    )
-  }
+  const sessionID = extractTaskSessionID(result) ?? "pending"
+  const output = extractTaskOutput(result) || extractText(result) || `Submitted native subtask prompt ${extractAdmittedID(result) ?? ""}`.trim()
   if (sessionID === "unknown") {
-    logRun(run, "Subtask result did not expose child session id", { stepID: step.id, rawResult: result })
+    logRun(run, "V2 native subtask result did not expose child session id", { stepID: step.id, rawResult: result })
   } else {
-    logRun(run, "Subtask child session resolved", { stepID: step.id, sessionID })
+    logRun(run, "V2 native subtask prompt accepted", { stepID: step.id, sessionID })
   }
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
   state[step.id] = { output }
@@ -327,6 +326,11 @@ function extractTaskSessionID(input: unknown): string | undefined {
 function extractTaskOutput(input: unknown): string | undefined {
   const text = extractText(input)
   return text?.match(/<task_result>\s*([\s\S]*?)\s*<\/task_result>/)?.[1]?.trim()
+}
+
+function extractAdmittedID(input: unknown): string | undefined {
+  const data = unwrapData(input)
+  return findStringKey(data, ["id", "messageID"])
 }
 
 function findStringKey(input: unknown, keys: string[]): string | undefined {

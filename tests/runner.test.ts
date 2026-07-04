@@ -11,9 +11,17 @@ import type { OpencodeClient } from "@opencode-ai/sdk"
 type TestSessionClient = Partial<Record<keyof OpencodeClient["session"], (...args: any[]) => any>> & {
   wait?: (input: Record<string, unknown>) => Promise<unknown>
 }
+type TestV2SessionClient = {
+  prompt?: (input: Record<string, unknown>) => Promise<unknown>
+}
 
-function testRuntime(root: string, session: TestSessionClient): RuntimeContext {
-  return { directory: root, worktree: root, client: { session: session as RuntimeContext["client"]["session"] } }
+function testRuntime(root: string, session: TestSessionClient, v2Session?: TestV2SessionClient): RuntimeContext {
+  return {
+    directory: root,
+    worktree: root,
+    client: { session: session as RuntimeContext["client"]["session"] },
+    v2Client: v2Session ? ({ session: v2Session } as RuntimeContext["v2Client"]) : undefined,
+  }
 }
 
 const yaml = `
@@ -71,6 +79,7 @@ describe("workflow runner", () => {
   test("defaults to async and wakes parent", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
     const prompts: unknown[] = []
+    const v2Prompts: unknown[] = []
     const creates: unknown[] = []
     const runtime = testRuntime(root, {
           create: async (input) => {
@@ -79,11 +88,14 @@ describe("workflow runner", () => {
           },
           prompt: async (input) => {
             prompts.push(input)
-            return prompts.length === 1
-              ? { data: { parts: [{ text: '<task id="child-subtask" state="completed">\n<task_result>async output</task_result>\n</task>' }] } }
-              : {}
+            return {}
           },
           messages: async () => ({ data: [{ parts: [{ text: "async output" }] }] }),
+        }, {
+          prompt: async (input) => {
+            v2Prompts.push(input)
+            return { data: { id: "msg-1", sessionID: "parent-1" } }
+          },
         })
     const tool: ToolRuntimeContext = { sessionID: "parent-1", directory: root, worktree: root }
     try {
@@ -91,9 +103,9 @@ describe("workflow runner", () => {
       expect(run.async).toBe(true)
       await new Promise((resolve) => setTimeout(resolve, 25))
       expect(creates).toHaveLength(0)
-      expect(prompts[0]).toMatchObject({ path: { id: "parent-1" }, query: { directory: root } })
-      expect(JSON.stringify(prompts[0])).toContain('"type":"subtask"')
-      expect(JSON.stringify(prompts[0])).toContain("workflow:run-me/one")
+      expect(v2Prompts[0]).toMatchObject({ sessionID: "parent-1", delivery: "queue" })
+      expect(JSON.stringify(v2Prompts[0])).toContain("workflow:run-me/one")
+      expect(JSON.stringify(v2Prompts[0])).toContain('"agents"')
       expect(JSON.stringify(prompts)).toContain("parent-1")
       expect(JSON.stringify(prompts)).toContain("workflow:run-me")
     } finally {
@@ -174,10 +186,12 @@ steps:
     }
   })
 
-  test("does not mark subtask SDK error envelopes as completed", async () => {
+  test("does not mark v2 native subtask SDK error envelopes as completed", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
     const runtime = testRuntime(root, {
           create: async () => ({ id: "should-not-fallback" }),
+          prompt: async () => ({}),
+        }, {
           prompt: async () => ({ error: { code: "SESSION_BUSY", message: "session is busy" }, request: { timeout: false }, response: { status: 409 } }),
         })
     try {
