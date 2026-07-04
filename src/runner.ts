@@ -9,8 +9,9 @@ type SessionCreateInput = NonNullable<Parameters<SDKSession["create"]>[0]>
 type SessionGetInput = Parameters<SDKSession["get"]>[0]
 type SessionMessagesInput = Parameters<SDKSession["messages"]>[0]
 type SessionPromptInput = Parameters<SDKSession["prompt"]>[0]
-type SDKV2Session = ReturnType<typeof createOpencodeClient>["v2"]["session"]
-type SessionV2WaitInput = Parameters<SDKV2Session["wait"]>[0]
+
+const CHILD_SESSION_TIMEOUT_MS = 15 * 60 * 1000
+const PARENT_NOTIFICATION_TIMEOUT_MS = 5_000
 
 const activeRuns = new Map<string, { cancelled: boolean }>()
 
@@ -179,12 +180,7 @@ async function executePromptStep(
   if (Object.keys(settings.tools).length > 0) promptInput.tools = settings.tools
   if (settings.system) promptInput.system = settings.system
   logRun(run, "Prompting direct child session", { stepID: step.id, promptInput })
-  const promptResult = await runtime.client.session.prompt(promptInput)
-  const promptEnvelopeError = formatSDKEnvelopeError(promptResult)
-  if (promptEnvelopeError) {
-    throw new Error(`Failed to prompt child session for step ${step.id}.\nPrompt input:\n${safeJson(promptInput)}\n${promptEnvelopeError}`)
-  }
-  await waitForSessionIdle(runtime, run, sessionID, sessionDirectory, step.id)
+  const promptResult = await waitForChildPrompt(runtime, run, sessionID, sessionDirectory, step.id, promptInput)
   const output = (await readSessionOutput(runtime, sessionID, sessionDirectory)) || extractText(promptResult) || ""
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
   state[step.id] = { output }
@@ -256,32 +252,32 @@ async function resolveParentSessionDirectory(runtime: RuntimeContext, parentSess
   return runtime.directory
 }
 
-async function waitForSessionIdle(runtime: RuntimeContext, run: WorkflowRun, sessionID: string, directory: string | undefined, stepID: string) {
-  const input: SessionV2WaitInput = { sessionID, directory }
-  // The preceding v2 session.prompt call is synchronous and resolves after the agent loop completes.
-  // v2 wait is an extra guard when the server supports it; older servers return ServiceUnavailable.
-  const result = await runtime.client.v2.session.wait(input).catch((error) => {
-    if (isSessionWaitUnavailable(error)) {
-      logRun(run, "v2 session wait unavailable; continuing after synchronous prompt", { stepID, sessionID })
-      return undefined
-    }
-    throw new Error(`Failed to wait for child session for step ${stepID}.\nSession ID: ${sessionID}\nError:\n${formatUnknownError(error)}`)
-  })
-  if (result === undefined) return
-  const envelopeError = formatSDKEnvelopeError(result)
-  if (envelopeError && isSessionWaitUnavailable(result)) {
-    logRun(run, "v2 session wait unavailable; continuing after synchronous prompt", { stepID, sessionID, envelope: result })
-    return
+async function waitForChildPrompt(
+  runtime: RuntimeContext,
+  run: WorkflowRun,
+  sessionID: string,
+  directory: string | undefined,
+  stepID: string,
+  promptInput: SessionPromptInput,
+) {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    const result = await Promise.race([
+      runtime.client.session.prompt(promptInput),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`Child session timed out after ${CHILD_SESSION_TIMEOUT_MS / 1000}s`)), CHILD_SESSION_TIMEOUT_MS)
+      }),
+    ])
+    const envelopeError = formatSDKEnvelopeError(result)
+    if (envelopeError) throw new Error(`Failed to prompt child session for step ${stepID}.\nPrompt input:\n${safeJson(promptInput)}\n${envelopeError}`)
+    return result
+  } catch (error) {
+    await notifyParentTask(runtime, run, stepID, sessionID, "error", formatUnknownError(error))
+    throw error
+  } finally {
+    if (timeout) clearTimeout(timeout)
+    logRun(run, "Child prompt reached terminal signal", { stepID, sessionID, directory })
   }
-  if (envelopeError) throw new Error(`Failed to wait for child session for step ${stepID}.\nSession ID: ${sessionID}\n${envelopeError}`)
-}
-
-function isSessionWaitUnavailable(input: unknown) {
-  if (input instanceof Error) return input.message.includes("Session wait is not available yet") || input.message.includes("session.wait")
-  if (!isRecord(input)) return false
-  const error = input.error
-  if (!isRecord(error)) return false
-  return error._tag === "ServiceUnavailableError" && (error.service === "session.wait" || error.message === "Session wait is not available yet")
 }
 
 async function wakeParent(runtime: RuntimeContext, run: WorkflowRun) {
@@ -321,9 +317,22 @@ async function notifyParentTask(
     parts: [{ type: "text", synthetic: true, text: body }],
   }
   logRun(run, "Injecting parent task-like notification", { stepID, sessionID, state })
-  await runtime.client.session.prompt?.(input).catch((error) => {
-    logRun(run, "Failed to inject parent task-like notification", { stepID, sessionID, error: formatUnknownError(error) })
-  })
+  let timeout: ReturnType<typeof setTimeout> | undefined
+  try {
+    const send = runtime.client.session.promptAsync?.bind(runtime.client.session) ?? runtime.client.session.prompt.bind(runtime.client.session)
+    const result = await Promise.race([
+      send(input),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`parent notification timed out after ${PARENT_NOTIFICATION_TIMEOUT_MS}ms`)), PARENT_NOTIFICATION_TIMEOUT_MS)
+      }),
+    ])
+    const envelopeError = formatSDKEnvelopeError(result)
+    if (envelopeError) throw new Error(envelopeError)
+  } catch (error) {
+    logRun(run, "Queued parent task-like notification after send failure", { stepID, sessionID, state, notification: body, error: formatUnknownError(error) })
+  } finally {
+    if (timeout) clearTimeout(timeout)
+  }
 }
 
 function renderTaskNotification(input: {
