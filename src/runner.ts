@@ -184,7 +184,7 @@ async function executePromptStep(
   if (promptEnvelopeError) {
     throw new Error(`Failed to prompt child session for step ${step.id}.\nPrompt input:\n${safeJson(promptInput)}\n${promptEnvelopeError}`)
   }
-  await waitForSessionIdle(runtime, sessionID, sessionDirectory, step.id)
+  await waitForSessionIdle(runtime, run, sessionID, sessionDirectory, step.id)
   const output = (await readSessionOutput(runtime, sessionID, sessionDirectory)) || extractText(promptResult) || ""
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
   state[step.id] = { output }
@@ -256,14 +256,32 @@ async function resolveParentSessionDirectory(runtime: RuntimeContext, parentSess
   return runtime.directory
 }
 
-async function waitForSessionIdle(runtime: RuntimeContext, sessionID: string, directory: string | undefined, stepID: string) {
+async function waitForSessionIdle(runtime: RuntimeContext, run: WorkflowRun, sessionID: string, directory: string | undefined, stepID: string) {
   const input: SessionV2WaitInput = { sessionID, directory }
-  // v2 wait blocks until the child session's agent loop is idle; this keeps serial workflow steps ordered.
+  // The preceding v2 session.prompt call is synchronous and resolves after the agent loop completes.
+  // v2 wait is an extra guard when the server supports it; older servers return ServiceUnavailable.
   const result = await runtime.client.v2.session.wait(input).catch((error) => {
+    if (isSessionWaitUnavailable(error)) {
+      logRun(run, "v2 session wait unavailable; continuing after synchronous prompt", { stepID, sessionID })
+      return undefined
+    }
     throw new Error(`Failed to wait for child session for step ${stepID}.\nSession ID: ${sessionID}\nError:\n${formatUnknownError(error)}`)
   })
+  if (result === undefined) return
   const envelopeError = formatSDKEnvelopeError(result)
+  if (envelopeError && isSessionWaitUnavailable(result)) {
+    logRun(run, "v2 session wait unavailable; continuing after synchronous prompt", { stepID, sessionID, envelope: result })
+    return
+  }
   if (envelopeError) throw new Error(`Failed to wait for child session for step ${stepID}.\nSession ID: ${sessionID}\n${envelopeError}`)
+}
+
+function isSessionWaitUnavailable(input: unknown) {
+  if (input instanceof Error) return input.message.includes("Session wait is not available yet") || input.message.includes("session.wait")
+  if (!isRecord(input)) return false
+  const error = input.error
+  if (!isRecord(error)) return false
+  return error._tag === "ServiceUnavailableError" && (error.service === "session.wait" || error.message === "Session wait is not available yet")
 }
 
 async function wakeParent(runtime: RuntimeContext, run: WorkflowRun) {
@@ -442,13 +460,29 @@ function resolveWorkflowInputs(workflow: Workflow, input: Record<string, unknown
     const value = resolved[name]
     if (definition.required && (value === undefined || value === null || value === "")) {
       const provided = Object.keys(input).length ? Object.keys(input).join(", ") : "none"
-      throw new Error(`Missing required workflow input "${name}" for workflow ${workflow.id}. Provided inputs: ${provided}.`)
+      throw new Error(`Missing required workflow input "${name}" for workflow ${workflow.id}. Provided inputs: ${provided}.\n\n${formatWorkflowInputContract(workflow)}`)
     }
     if (value !== undefined && value !== null && !matchesInputType(value, definition.type ?? "string")) {
-      throw new Error(`Invalid workflow input "${name}" for workflow ${workflow.id}: expected ${definition.type ?? "string"}, got ${Array.isArray(value) ? "array" : typeof value}.`)
+      throw new Error(`Invalid workflow input "${name}" for workflow ${workflow.id}: expected ${definition.type ?? "string"}, got ${Array.isArray(value) ? "array" : typeof value}.\n\n${formatWorkflowInputContract(workflow)}`)
     }
   }
   return resolved
+}
+
+function formatWorkflowInputContract(workflow: Workflow) {
+  const entries = Object.entries(workflow.inputs)
+  if (entries.length === 0) return `Workflow ${workflow.id} defines no inputs.`
+  return [
+    `Workflow ${workflow.id} input contract:`,
+    ...entries.map(([name, definition]) => {
+      const required = definition.required ? "required" : "optional"
+      const type = definition.type ?? "string"
+      const defaultText = definition.default === undefined ? "" : `; default=${JSON.stringify(definition.default)}`
+      const description = definition.description ? `; ${definition.description}` : ""
+      return `- ${name}: ${type}, ${required}${defaultText}${description}`
+    }),
+    "Provide workflow action=run inputs as an object matching this contract.",
+  ].join("\n")
 }
 
 function matchesInputType(value: unknown, type: string) {

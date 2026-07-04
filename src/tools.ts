@@ -42,7 +42,10 @@ export function createWorkflowTools(runtime: RuntimeContext) {
             const registry = await discoverWorkflows(context)
             return (
               registry.workflows
-                .map(({ workflow, path, scope }) => `- ${workflow.id} (${scope}) ${workflow.name}: ${workflow.description}\n  ${path}`)
+                .map(({ workflow, path, scope }) => `- ${workflow.id} (${scope}) ${workflow.name}: ${workflow.description}\n  ${path}\n${formatWorkflowInputs(workflow)
+                  .split("\n")
+                  .map((line) => `  ${line}`)
+                  .join("\n")}`)
                 .join("\n") || "No workflows found."
             )
           }
@@ -93,12 +96,33 @@ export function createWorkflowTools(runtime: RuntimeContext) {
 }
 
 function formatRunOutput(run: { id: string; async: boolean; status: string; result?: string; error?: string; logs?: string[] }) {
-  if (run.async && run.status === "queued") return `Started async workflow run ${run.id}.`
+  if (run.async && run.status === "queued") {
+    return [
+      `Started async workflow run ${run.id}.`,
+      "Do not repeatedly call workflow action=status or poll for completion.",
+      "The workflow runs in the background and will automatically wake this parent session with task-like notifications and a final summary.",
+    ].join("\n")
+  }
   if (run.status === "failed") {
     const logs = run.logs?.length ? `\n\nWorkflow logs:\n${run.logs.slice(-30).join("\n")}` : ""
     return `Workflow ${run.id} failed.\n\n${run.error ?? "No error details."}${logs}`
   }
   return run.result || `Workflow ${run.status}.`
+}
+
+function formatWorkflowInputs(workflow: Workflow) {
+  const entries = Object.entries(workflow.inputs)
+  if (entries.length === 0) return "Inputs: none"
+  return [
+    "Inputs:",
+    ...entries.map(([name, definition]) => {
+      const required = definition.required ? "required" : "optional"
+      const type = definition.type ?? "string"
+      const defaultText = definition.default === undefined ? "" : `; default=${JSON.stringify(definition.default)}`
+      const description = definition.description ? `; ${definition.description}` : ""
+      return `- ${name}: ${type}, ${required}${defaultText}${description}`
+    }),
+  ].join("\n")
 }
 
 async function resolveWorkflow(runtime: RuntimeContext, context: ToolRuntimeContext, workflowID?: string, yaml?: string): Promise<Workflow> {

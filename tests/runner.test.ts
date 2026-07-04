@@ -102,7 +102,7 @@ describe("workflow runner", () => {
           messages: async () => ({ data: [{ parts: [{ text: "async output" }] }] }),
         }, { wait: async (input) => {
           waits.push(input)
-          return {}
+          return { error: { _tag: "ServiceUnavailableError", message: "Session wait is not available yet", service: "session.wait" }, request: { timeout: false }, response: { status: 503 } }
         } })
     const tool: ToolRuntimeContext = { sessionID: "parent-1", directory: root, worktree: root }
     try {
@@ -119,6 +119,7 @@ describe("workflow runner", () => {
       const stored = await loadRun(root, run.id)
       expect(stored.result).toContain("async output")
       expect(stored.childSessions.one).toMatchObject({ sessionID: "child-1", status: "completed", output: "async output" })
+      expect(stored.logs?.join("\n")).toContain("v2 session wait unavailable; continuing after synchronous prompt")
       expect(JSON.stringify(prompts)).toContain("parent-1")
       expect(JSON.stringify(prompts)).toContain("workflow:run-me")
     } finally {

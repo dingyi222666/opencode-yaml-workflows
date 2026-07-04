@@ -52,6 +52,7 @@ Execution rules:
 
 - workflow action=run defaults to async true unless async is explicitly false.
 - async model-running steps create real child sessions with parentID, wait for completion in the background, and inject task-like synthetic notifications back into the parent session.
+- after starting an async run, do not repeatedly poll workflow action=status; the parent session is automatically notified when workflow steps finish and when the run completes.
 - sync model-running steps also create child sessions with parentID directly, but do not inject per-step async notifications.
 - generated or inline YAML must validate against this shape before execution.
 - agent, model, tools, skills, system, context, and format are optional. Missing values mean use opencode defaults/current session behavior.
