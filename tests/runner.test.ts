@@ -194,4 +194,32 @@ steps:
       await rm(root, { recursive: true, force: true })
     }
   })
+
+  test("does not mark subtask SDK error envelopes as completed", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
+    const runtime: RuntimeContext = {
+      directory: root,
+      worktree: root,
+      client: {
+        session: {
+          create: async () => ({ id: "should-not-fallback" }),
+          prompt: async () => ({ error: { code: "SESSION_BUSY", message: "session is busy" }, request: { timeout: false }, response: { status: 409 } }),
+        },
+      },
+    }
+    try {
+      const run = await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: true })
+      expect(run.async).toBe(true)
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      const stored = await loadRun(root, run.id)
+      expect(stored.status).toBe("failed")
+      expect(stored.error).toContain("SESSION_BUSY")
+      expect(stored.childSessions.one?.status).toBe("failed")
+      const logs = stored.logs?.join("\n") ?? ""
+      expect(logs).toContain("Native subtask execution failed")
+      expect(logs).not.toContain("Creating direct child session")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
 })

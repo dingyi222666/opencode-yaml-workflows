@@ -141,8 +141,17 @@ async function executePromptStep(
   const model = settings.model ? parseModel(settings.model) : undefined
   const prompt = buildStepPrompt(step, settings, run.inputs, state)
   if (run.async && runtime.client.session.prompt) {
-    await executeSubtaskStep(runtime, tool, workflow, run, step, state, prompt, settings.agent ?? tool.agent ?? "general", model)
-    return
+    try {
+      await executeSubtaskStep(runtime, tool, workflow, run, step, state, prompt, settings.agent ?? tool.agent ?? "general", model)
+      return
+    } catch (error) {
+      const details = formatUnknownError(error)
+      logRun(run, "Native subtask execution failed", {
+        stepID: step.id,
+        error: details,
+      })
+      throw new Error(`Native subtask execution failed for step ${step.id}. Direct child-session fallback is disabled for async runs because it would not create native opencode task notifications.\n${details}`)
+    }
   }
 
   const createInput = {
@@ -157,6 +166,10 @@ async function executePromptStep(
   const session = await runtime.client.session.create(createInput).catch((error) => {
     throw new Error(`Failed to create child session for step ${step.id}.\nCreate input:\n${safeJson(createInput)}\nError:\n${formatUnknownError(error)}`)
   })
+  const createEnvelopeError = formatSDKEnvelopeError(session)
+  if (createEnvelopeError) {
+    throw new Error(`Failed to create child session for step ${step.id}.\nCreate input:\n${safeJson(createInput)}\n${createEnvelopeError}`)
+  }
   const sessionID = extractSessionID(session)
   if (!sessionID) {
     throw new Error(
@@ -175,6 +188,10 @@ async function executePromptStep(
   if (settings.system) promptInput.system = settings.system
   logRun(run, "Prompting direct child session", { stepID: step.id, promptInput })
   const promptResult = run.async && runtime.client.session.prompt_async ? await runtime.client.session.prompt_async(promptInput) : await runtime.client.session.prompt?.(promptInput)
+  const promptEnvelopeError = formatSDKEnvelopeError(promptResult)
+  if (promptEnvelopeError) {
+    throw new Error(`Failed to prompt child session for step ${step.id}.\nPrompt input:\n${safeJson(promptInput)}\n${promptEnvelopeError}`)
+  }
   if (!run.async) await runtime.client.session.wait?.({ sessionID })
   const output = (await readSessionOutput(runtime, sessionID)) || extractText(promptResult) || ""
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
@@ -214,8 +231,17 @@ async function executeSubtaskStep(
   const result = await runtime.client.session.prompt?.(parentPromptInput).catch((error) => {
     throw new Error(`Failed to submit subtask part for step ${step.id}.\nPrompt input:\n${safeJson(parentPromptInput)}\nError:\n${formatUnknownError(error)}`)
   })
+  const envelopeError = formatSDKEnvelopeError(result)
+  if (envelopeError) {
+    throw new Error(`Failed to submit subtask part for step ${step.id}.\nPrompt input:\n${safeJson(parentPromptInput)}\n${envelopeError}`)
+  }
   const sessionID = extractTaskSessionID(result) ?? "unknown"
   const output = extractTaskOutput(result) || extractText(result) || ""
+  if (sessionID === "unknown" && !output) {
+    throw new Error(
+      `Subtask submission for step ${step.id} returned no child session id and no output.\nPrompt input:\n${safeJson(parentPromptInput)}\nRaw response:\n${safeJson(result)}`,
+    )
+  }
   if (sessionID === "unknown") {
     logRun(run, "Subtask result did not expose child session id", { stepID: step.id, rawResult: result })
   } else {
@@ -316,8 +342,40 @@ function logRun(run: WorkflowRun, message: string, data?: unknown) {
 }
 
 function formatUnknownError(error: unknown) {
-  if (error instanceof Error) return [error.message, error.stack].filter(Boolean).join("\n")
+  if (error instanceof Error) {
+    const extra = objectDetails(error)
+    return [error.message, error.stack, extra === "{}" ? undefined : extra].filter(Boolean).join("\n")
+  }
+  if (typeof error === "object" && error !== null) {
+    const details = objectDetails(error)
+    const asString = String(error)
+    return details === "{}" ? asString : details
+  }
   return safeJson(error)
+}
+
+function formatSDKEnvelopeError(input: unknown) {
+  if (!isRecord(input) || !("error" in input) || input.error === undefined || input.error === null) return undefined
+  return [
+    "SDK returned an error envelope.",
+    `Error: ${formatUnknownError(input.error)}`,
+    `Request: ${safeJson(input.request)}`,
+    `Response: ${safeJson(input.response)}`,
+    `Raw envelope: ${safeJson(input)}`,
+  ].join("\n")
+}
+
+function objectDetails(value: object) {
+  const out: Record<string, unknown> = {
+    constructor: value.constructor?.name,
+  }
+  for (const key of Object.getOwnPropertyNames(value)) {
+    out[key] = (value as Record<string, unknown>)[key]
+  }
+  for (const [key, current] of Object.entries(value)) {
+    out[key] = current
+  }
+  return safeJson(out)
 }
 
 function safeJson(value: unknown) {
