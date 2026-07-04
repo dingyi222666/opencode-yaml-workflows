@@ -1,6 +1,6 @@
 {
   "name": "opencode-yaml-workflows",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "YAML workflow plugin for opencode child-session subagents",
   "type": "module",
   "main": "dist/index.js",
