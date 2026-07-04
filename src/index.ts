@@ -10,13 +10,46 @@ export { runWorkflow, statusWorkflow, cancelWorkflow } from "./runner.js"
 export { WORKFLOW_SCHEMA_TEXT } from "./schema.js"
 export type * from "./types.js"
 
-const server: Plugin = async ({ client, directory, worktree }) => {
+const server: Plugin = async ({ client, directory, worktree, serverUrl }) => {
+  const previousNoProxy = {
+    no_proxy: process.env.no_proxy,
+    NO_PROXY: process.env.NO_PROXY,
+  }
+  ensureNoProxyFor(serverUrl)
   return {
+    dispose: async () => {
+      restoreEnv("no_proxy", previousNoProxy.no_proxy)
+      restoreEnv("NO_PROXY", previousNoProxy.NO_PROXY)
+    },
     config: async (config) => {
       injectWorkflowCommand(config)
     },
     tool: createWorkflowTools({ client, directory, worktree }),
   }
+}
+
+function ensureNoProxyFor(input: URL) {
+  const entries = new Set<string>()
+  for (const current of [process.env.no_proxy, process.env.NO_PROXY]) {
+    for (const item of (current ?? "").split(",")) {
+      const value = item.trim()
+      if (value) entries.add(value)
+    }
+  }
+  entries.add(input.hostname)
+  if (input.hostname === "0.0.0.0" || input.hostname === "::") {
+    entries.add("127.0.0.1")
+    entries.add("localhost")
+    entries.add("0.0.0.0")
+  }
+  const next = Array.from(entries).join(",")
+  process.env.no_proxy = next
+  process.env.NO_PROXY = next
+}
+
+function restoreEnv(key: "no_proxy" | "NO_PROXY", value: string | undefined) {
+  if (value === undefined) delete process.env[key]
+  else process.env[key] = value
 }
 
 export default { id: "opencode-yaml-workflows", server } satisfies PluginModule

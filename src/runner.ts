@@ -229,8 +229,9 @@ async function createChildSession(
   parentDirectory: string,
 ) {
   const title = `workflow:${workflow.id}/${step.id}`
+  const directInput = { parentID: run.parentSessionID, title }
   const createInput: SessionCreateInput = {
-    body: { parentID: run.parentSessionID, title },
+    body: directInput,
     query: parentDirectory ? { directory: parentDirectory } : undefined,
   }
   logRun(run, "Creating direct child session in parent directory", { stepID: step.id, parentDirectory, createInput })
