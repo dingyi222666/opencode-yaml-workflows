@@ -1,7 +1,7 @@
 import { createRunID, loadRun, saveRun } from "./persistence.js"
 import { renderTemplate, resolveStepSettings } from "./parser.js"
 import type { RuntimeContext, ToolRuntimeContext, Workflow, WorkflowRun, WorkflowStep } from "./types.js"
-import type { createOpencodeClient } from "@opencode-ai/sdk"
+import type { createOpencodeClient } from "@opencode-ai/sdk/v2"
 
 type SDKSession = ReturnType<typeof createOpencodeClient>["session"]
 type SessionAbortInput = Parameters<SDKSession["abort"]>[0]
@@ -9,8 +9,8 @@ type SessionCreateInput = NonNullable<Parameters<SDKSession["create"]>[0]>
 type SessionGetInput = Parameters<SDKSession["get"]>[0]
 type SessionMessagesInput = Parameters<SDKSession["messages"]>[0]
 type SessionPromptInput = Parameters<SDKSession["prompt"]>[0]
-type SessionPromptAsyncInput = Parameters<SDKSession["promptAsync"]>[0]
-type SessionPromptBody = NonNullable<SessionPromptInput["body"]>
+type SDKV2Session = ReturnType<typeof createOpencodeClient>["v2"]["session"]
+type SessionV2WaitInput = Parameters<SDKV2Session["wait"]>[0]
 
 const activeRuns = new Map<string, { cancelled: boolean }>()
 
@@ -86,7 +86,7 @@ export async function cancelWorkflow(runtime: RuntimeContext, runID: string) {
   logRun(run, "Workflow run cancelled", { runID })
   for (const child of Object.values(run.childSessions)) {
     if (child.status === "running") {
-      const abortInput: SessionAbortInput = { path: { id: child.sessionID }, query: runtime.directory ? { directory: runtime.directory } : undefined }
+      const abortInput: SessionAbortInput = { sessionID: child.sessionID, directory: runtime.directory }
       await runtime.client.session.abort?.(abortInput).catch(() => undefined)
     }
     child.status = child.status === "completed" ? child.status : "cancelled"
@@ -159,7 +159,7 @@ async function executePromptStep(
   const parentDirectory = await resolveParentSessionDirectory(runtime, run.parentSessionID)
   const targetDirectory = runtime.directory
   const prompt = buildStepPrompt(step, settings, run.inputs, state, { parentDirectory, targetDirectory })
-  const session = await createChildSession(runtime, workflow, run, step, parentDirectory)
+  const session = await createChildSession(runtime, workflow, run, step, parentDirectory, settings.agent)
   const sessionID = extractSessionID(session)
   if (!sessionID) {
     throw new Error(
@@ -169,28 +169,22 @@ async function executePromptStep(
   logRun(run, "Direct child session created", { stepID: step.id, sessionID })
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "running" }
   await saveRun(runtime.worktree, run)
+  if (run.async) await notifyParentTask(runtime, run, step.id, sessionID, "running", `Workflow step started: ${step.id}`)
 
-  const promptBody: SessionPromptBody = { parts: [{ type: "text", text: prompt }] }
-  if (settings.agent) promptBody.agent = settings.agent
-  if (model) promptBody.model = model
-  if (Object.keys(settings.tools).length > 0) promptBody.tools = settings.tools
-  if (settings.system) promptBody.system = settings.system
   const sessionData = unwrapData(session)
   const sessionDirectory = isRecord(sessionData) && typeof sessionData.directory === "string" ? sessionData.directory : parentDirectory
-  const promptInput: SessionPromptInput = { path: { id: sessionID }, body: promptBody, query: sessionDirectory ? { directory: sessionDirectory } : undefined }
+  const promptInput: SessionPromptInput = { sessionID, directory: sessionDirectory, parts: [{ type: "text", text: prompt }] }
+  if (settings.agent) promptInput.agent = settings.agent
+  if (model) promptInput.model = model
+  if (Object.keys(settings.tools).length > 0) promptInput.tools = settings.tools
+  if (settings.system) promptInput.system = settings.system
   logRun(run, "Prompting direct child session", { stepID: step.id, promptInput })
-  const promptResult = run.async && runtime.client.session.promptAsync
-    ? await runtime.client.session.promptAsync(promptInput as SessionPromptAsyncInput)
-    : await runtime.client.session.prompt?.(promptInput)
+  const promptResult = await runtime.client.session.prompt(promptInput)
   const promptEnvelopeError = formatSDKEnvelopeError(promptResult)
   if (promptEnvelopeError) {
     throw new Error(`Failed to prompt child session for step ${step.id}.\nPrompt input:\n${safeJson(promptInput)}\n${promptEnvelopeError}`)
   }
-  if (runtime.client.session.wait) {
-    await runtime.client.session.wait({ sessionID }).catch((error) => {
-      throw new Error(`Failed to wait for child session for step ${step.id}.\nSession ID: ${sessionID}\nError:\n${formatUnknownError(error)}`)
-    })
-  }
+  await waitForSessionIdle(runtime, sessionID, sessionDirectory, step.id)
   const output = (await readSessionOutput(runtime, sessionID, sessionDirectory)) || extractText(promptResult) || ""
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
   state[step.id] = { output }
@@ -216,7 +210,7 @@ function buildStepPrompt(
 }
 
 async function readSessionOutput(runtime: RuntimeContext, sessionID: string, directory?: string) {
-  const messagesInput: SessionMessagesInput = { path: { id: sessionID }, query: directory ? { directory } : undefined }
+  const messagesInput: SessionMessagesInput = { sessionID, directory }
   const messages = await runtime.client.session.messages?.(messagesInput).catch(() => undefined)
   return extractText(messages)
 }
@@ -227,12 +221,15 @@ async function createChildSession(
   run: WorkflowRun,
   step: WorkflowStep,
   parentDirectory: string,
+  agent?: string,
 ) {
   const title = `workflow:${workflow.id}/${step.id}`
-  const directInput = { parentID: run.parentSessionID, title }
   const createInput: SessionCreateInput = {
-    body: directInput,
-    query: parentDirectory ? { directory: parentDirectory } : undefined,
+    parentID: run.parentSessionID,
+    title,
+    directory: parentDirectory,
+    agent,
+    metadata: { workflowID: workflow.id, runID: run.id, stepID: step.id, parentSessionID: run.parentSessionID },
   }
   logRun(run, "Creating direct child session in parent directory", { stepID: step.id, parentDirectory, createInput })
   const session = await runtime.client.session.create(createInput).catch((error) => {
@@ -249,7 +246,7 @@ async function resolveParentSessionDirectory(runtime: RuntimeContext, parentSess
 
   const candidates = [runtime.directory, undefined]
   for (const directory of candidates) {
-    const input: SessionGetInput = { path: { id: parentSessionID }, query: directory ? { directory } : undefined }
+    const input: SessionGetInput = { sessionID: parentSessionID, directory }
     const result = await getSession(input).catch(() => undefined)
     const envelopeError = formatSDKEnvelopeError(result)
     if (envelopeError) continue
@@ -257,6 +254,16 @@ async function resolveParentSessionDirectory(runtime: RuntimeContext, parentSess
     if (isRecord(data) && typeof data.directory === "string") return data.directory
   }
   return runtime.directory
+}
+
+async function waitForSessionIdle(runtime: RuntimeContext, sessionID: string, directory: string | undefined, stepID: string) {
+  const input: SessionV2WaitInput = { sessionID, directory }
+  // v2 wait blocks until the child session's agent loop is idle; this keeps serial workflow steps ordered.
+  const result = await runtime.client.v2.session.wait(input).catch((error) => {
+    throw new Error(`Failed to wait for child session for step ${stepID}.\nSession ID: ${sessionID}\nError:\n${formatUnknownError(error)}`)
+  })
+  const envelopeError = formatSDKEnvelopeError(result)
+  if (envelopeError) throw new Error(`Failed to wait for child session for step ${stepID}.\nSession ID: ${sessionID}\n${envelopeError}`)
 }
 
 async function wakeParent(runtime: RuntimeContext, run: WorkflowRun) {
@@ -269,9 +276,10 @@ async function wakeParent(runtime: RuntimeContext, run: WorkflowRun) {
   const logs = run.status === "failed" && run.logs?.length ? `\n\nWorkflow logs:\n${run.logs.slice(-10).join("\n")}` : ""
   const parentDirectory = await resolveParentSessionDirectory(runtime, run.parentSessionID)
   const wakeInput: SessionPromptInput = {
-    path: { id: run.parentSessionID },
-    body: { noReply: false, parts: [{ type: "text", synthetic: true, text: `[workflow:${run.workflowID}] run ${run.id} ${run.status}\n\n${summary}${logs}` }] },
-    query: parentDirectory ? { directory: parentDirectory } : undefined,
+    sessionID: run.parentSessionID,
+    directory: parentDirectory,
+    noReply: false,
+    parts: [{ type: "text", synthetic: true, text: `[workflow:${run.workflowID}] run ${run.id} ${run.status}\n\n${summary}${logs}` }],
   }
   await runtime.client.session
     .prompt?.(wakeInput)
@@ -283,15 +291,16 @@ async function notifyParentTask(
   run: WorkflowRun,
   stepID: string,
   sessionID: string,
-  state: "completed" | "error",
+  state: "running" | "completed" | "error",
   text: string,
 ) {
   const body = renderTaskNotification({ stepID, sessionID, state, text })
   const parentDirectory = await resolveParentSessionDirectory(runtime, run.parentSessionID)
   const input: SessionPromptInput = {
-    path: { id: run.parentSessionID },
-    body: { noReply: true, parts: [{ type: "text", synthetic: true, text: body }] },
-    query: parentDirectory ? { directory: parentDirectory } : undefined,
+    sessionID: run.parentSessionID,
+    directory: parentDirectory,
+    noReply: true,
+    parts: [{ type: "text", synthetic: true, text: body }],
   }
   logRun(run, "Injecting parent task-like notification", { stepID, sessionID, state })
   await runtime.client.session.prompt?.(input).catch((error) => {
@@ -302,11 +311,11 @@ async function notifyParentTask(
 function renderTaskNotification(input: {
   stepID: string
   sessionID: string
-  state: "completed" | "error"
+  state: "running" | "completed" | "error"
   text: string
 }) {
-  const tag = input.state === "completed" ? "task_result" : "task_error"
-  const summary = `Workflow step ${input.state === "completed" ? "completed" : "failed"}: ${input.stepID}`
+  const tag = input.state === "error" ? "task_error" : "task_result"
+  const summary = `Workflow step ${input.state === "completed" ? "completed" : input.state === "running" ? "started" : "failed"}: ${input.stepID}`
   return [
     `<task id="${input.sessionID}" state="${input.state}">`,
     `<summary>${summary}</summary>`,
@@ -338,6 +347,8 @@ function extractText(input: unknown): string | undefined {
   if (typeof data.text === "string") return data.text
   if (typeof data.output === "string") return data.output
   if (isRecord(data.state) && typeof data.state.output === "string") return data.state.output
+  if (Array.isArray(data.content)) return data.content.map(extractText).filter(Boolean).join("\n")
+  if (Array.isArray(data.items)) return data.items.map(extractText).filter(Boolean).join("\n")
   if (Array.isArray(data.parts)) return data.parts.map(extractText).filter(Boolean).join("\n")
   if (Array.isArray(data.messages)) return data.messages.map(extractText).filter(Boolean).join("\n")
   return undefined

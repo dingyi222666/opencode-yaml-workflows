@@ -1,4 +1,5 @@
 import type { Plugin, PluginModule } from "@opencode-ai/plugin"
+import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { injectWorkflowCommand } from "./command.js"
 import { createWorkflowTools } from "./tools.js"
 
@@ -10,12 +11,13 @@ export { runWorkflow, statusWorkflow, cancelWorkflow } from "./runner.js"
 export { WORKFLOW_SCHEMA_TEXT } from "./schema.js"
 export type * from "./types.js"
 
-const server: Plugin = async ({ client, directory, worktree, serverUrl }) => {
+const server: Plugin = async ({ directory, worktree, serverUrl }) => {
   const previousNoProxy = {
     no_proxy: process.env.no_proxy,
     NO_PROXY: process.env.NO_PROXY,
   }
   ensureNoProxyFor(serverUrl)
+  const client = createOpencodeClient({ baseUrl: normalizeServerUrl(serverUrl), directory })
   return {
     dispose: async () => {
       restoreEnv("no_proxy", previousNoProxy.no_proxy)
@@ -26,6 +28,12 @@ const server: Plugin = async ({ client, directory, worktree, serverUrl }) => {
     },
     tool: createWorkflowTools({ client, directory, worktree }),
   }
+}
+
+function normalizeServerUrl(input: URL) {
+  const url = new URL(input.toString())
+  if (url.hostname === "0.0.0.0" || url.hostname === "::") url.hostname = "127.0.0.1"
+  return url.toString().replace(/\/$/, "")
 }
 
 function ensureNoProxyFor(input: URL) {

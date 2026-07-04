@@ -6,16 +6,21 @@ import { parseWorkflowYaml } from "../src/parser.js"
 import { loadRun } from "../src/persistence.js"
 import { runWorkflow } from "../src/runner.js"
 import type { RuntimeContext, ToolRuntimeContext } from "../src/types.js"
-import type { OpencodeClient } from "@opencode-ai/sdk"
+import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 
 type TestSessionClient = Partial<Record<keyof OpencodeClient["session"], (...args: any[]) => any>> & {
   wait?: (input: Record<string, unknown>) => Promise<unknown>
 }
-function testRuntime(root: string, session: TestSessionClient): RuntimeContext {
+type TestV2SessionClient = Partial<Record<keyof OpencodeClient["v2"]["session"], (...args: any[]) => any>>
+
+function testRuntime(root: string, session: TestSessionClient, v2Session: TestV2SessionClient = {}): RuntimeContext {
   return {
     directory: root,
     worktree: root,
-    client: { session: session as RuntimeContext["client"]["session"] },
+    client: {
+      session: session as RuntimeContext["client"]["session"],
+      v2: { session: v2Session as RuntimeContext["client"]["v2"]["session"] } as RuntimeContext["client"]["v2"],
+    },
   }
 }
 
@@ -56,14 +61,14 @@ describe("workflow runner", () => {
           },
           wait: async () => undefined,
           messages: async () => ({ data: [{ parts: [{ text: "child output" }] }] }),
-        })
+        }, { wait: async () => ({}) })
     const tool: ToolRuntimeContext = { sessionID: "parent-1", directory: root, worktree: root }
     try {
       const run = await runWorkflow({ runtime, tool, workflow: parseWorkflowYaml(yaml), inputs: { name: "task" }, async: false })
       expect(run.status).toBe("completed")
       expect(creates).toHaveLength(1)
-      expect(creates[0]).toMatchObject({ body: { parentID: "parent-1", title: "workflow:run-me/one" }, query: { directory: root } })
-      expect(prompts[0]).toMatchObject({ path: { id: "child-1" }, query: { directory: root }, body: { agent: "general", tools: { bash: false, grep: true } } })
+      expect(creates[0]).toMatchObject({ parentID: "parent-1", title: "workflow:run-me/one", directory: root, agent: "general" })
+      expect(prompts[0]).toMatchObject({ sessionID: "child-1", directory: root, agent: "general", tools: { bash: false, grep: true } })
       expect(JSON.stringify(prompts[0])).toContain("base")
       expect(JSON.stringify(prompts[0])).toContain("extra")
     } finally {
@@ -95,16 +100,20 @@ describe("workflow runner", () => {
             return undefined
           },
           messages: async () => ({ data: [{ parts: [{ text: "async output" }] }] }),
-        })
+        }, { wait: async (input) => {
+          waits.push(input)
+          return {}
+        } })
     const tool: ToolRuntimeContext = { sessionID: "parent-1", directory: root, worktree: root }
     try {
       const run = await runWorkflow({ runtime, tool, workflow: parseWorkflowYaml(yaml), inputs: {} })
       expect(run.async).toBe(true)
       await new Promise((resolve) => setTimeout(resolve, 25))
-      expect(creates[0]).toMatchObject({ body: { parentID: "parent-1", title: "workflow:run-me/one" }, query: { directory: "/parent/repo" } })
-      expect(prompts[0]).toMatchObject({ path: { id: "child-1" }, query: { directory: "/parent/repo" } })
-      expect(JSON.stringify(prompts[0])).toContain(`Target repository directory:\\n${root}`)
-      expect(waits).toContainEqual({ sessionID: "child-1" })
+      expect(creates[0]).toMatchObject({ parentID: "parent-1", title: "workflow:run-me/one", directory: "/parent/repo", agent: "general" })
+      expect(prompts[0]).toMatchObject({ sessionID: "parent-1", directory: "/parent/repo", noReply: true })
+      expect(prompts[1]).toMatchObject({ sessionID: "child-1", directory: "/parent/repo" })
+      expect(JSON.stringify(prompts[1])).toContain(`Target repository directory:\\n${root}`)
+      expect(waits).toContainEqual({ sessionID: "child-1", directory: "/parent/repo" })
       expect(JSON.stringify(prompts)).toContain('<task id=\\"child-1\\" state=\\"completed\\">')
       expect(JSON.stringify(prompts)).toContain("<task_result>")
       const stored = await loadRun(root, run.id)
@@ -153,10 +162,10 @@ steps:
           },
           prompt: async () => ({ data: { parts: [{ text: "ok" }] } }),
           messages: async () => ({ data: [{ parts: [{ text: "ok" }] }] }),
-        })
+        }, { wait: async () => ({}) })
     try {
       await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: false })
-      expect(creates[0]).toMatchObject({ body: { parentID: "parent-1" }, query: { directory: root } })
+      expect(creates[0]).toMatchObject({ parentID: "parent-1", directory: root })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -182,7 +191,7 @@ steps:
             return { data: { parts: [{ text: "ok" }] } }
           },
           messages: async () => ({ data: [{ parts: [{ text: "ok" }] }] }),
-        })
+        }, { wait: async () => ({}) })
     const noToolsYaml = `
 id: no-tools
 steps:
@@ -223,10 +232,9 @@ steps:
           create: async () => ({ id: "child-err" }),
           prompt: async (input) => {
             prompts.push(input)
-            return {}
+            return { error: { code: "SESSION_BUSY", message: "session is busy" }, request: { timeout: false }, response: { status: 409 } }
           },
-          promptAsync: async () => ({ error: { code: "SESSION_BUSY", message: "session is busy" }, request: { timeout: false }, response: { status: 409 } }),
-        })
+        }, { wait: async () => ({}) })
     try {
       const run = await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: true })
       expect(run.async).toBe(true)

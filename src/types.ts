@@ -1,4 +1,4 @@
-import type { createOpencodeClient } from "@opencode-ai/sdk"
+import type { createOpencodeClient } from "@opencode-ai/sdk/v2"
 
 export type WorkflowInputDefinition = {
   type?: "string" | "number" | "boolean" | "object" | "array"
@@ -97,9 +97,8 @@ export type WorkflowRegistry = {
 }
 
 export type OpencodeClient = {
-  session: ReturnType<typeof createOpencodeClient>["session"] & {
-    wait?(input: Record<string, unknown>): Promise<unknown>
-  }
+  session: ReturnType<typeof createOpencodeClient>["session"]
+  v2: ReturnType<typeof createOpencodeClient>["v2"]
 }
 
 export type RuntimeContext = {
