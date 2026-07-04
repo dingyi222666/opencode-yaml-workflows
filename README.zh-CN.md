@@ -219,7 +219,22 @@ steps:
 
 这个插件不会创建游离的 worker 会话。
 
-每个模型 step 都会用当前会话作为 `parentID` 创建子会话：
+默认异步执行时，每个模型 step 会作为 `subtask` part 发送回父会话。这样会走 opencode 自己的 task/subagent pipeline，由 opencode 创建子会话、生成 task 通知，并在 TUI 里真正挂到父会话下面。
+
+实际 subtask part 形状如下：
+
+```ts
+{
+  type: "subtask",
+  agent,
+  model,
+  description: `workflow:${workflowID}/${stepID}`,
+  command: "workflow",
+  prompt,
+}
+```
+
+显式同步执行时，插件保留兼容 fallback，会用当前会话作为 `parentID` 直接创建子会话：
 
 ```ts
 client.session.create({

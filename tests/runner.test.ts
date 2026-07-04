@@ -67,16 +67,21 @@ describe("workflow runner", () => {
   test("defaults to async and wakes parent", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
     const prompts: unknown[] = []
+    const creates: unknown[] = []
     const runtime: RuntimeContext = {
       directory: root,
       worktree: root,
       client: {
         session: {
-          create: async () => ({ id: "child-1" }),
-          prompt_async: async () => ({ data: { parts: [{ text: "ok" }] } }),
+          create: async (input) => {
+            creates.push(input)
+            return { id: "child-1" }
+          },
           prompt: async (input) => {
             prompts.push(input)
-            return {}
+            return prompts.length === 1
+              ? { data: { parts: [{ text: '<task id="child-subtask" state="completed">\n<task_result>async output</task_result>\n</task>' }] } }
+              : {}
           },
           messages: async () => ({ data: [{ parts: [{ text: "async output" }] }] }),
         },
@@ -87,8 +92,37 @@ describe("workflow runner", () => {
       const run = await runWorkflow({ runtime, tool, workflow: parseWorkflowYaml(yaml), inputs: {} })
       expect(run.async).toBe(true)
       await new Promise((resolve) => setTimeout(resolve, 25))
+      expect(creates).toHaveLength(0)
+      expect(prompts[0]).toMatchObject({ sessionID: "parent-1" })
+      expect(JSON.stringify(prompts[0])).toContain('"type":"subtask"')
+      expect(JSON.stringify(prompts[0])).toContain("workflow:run-me/one")
       expect(JSON.stringify(prompts)).toContain("parent-1")
       expect(JSON.stringify(prompts)).toContain("workflow:run-me")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("sync execution keeps direct child-session fallback", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
+    const creates: unknown[] = []
+    const runtime: RuntimeContext = {
+      directory: root,
+      worktree: root,
+      client: {
+        session: {
+          create: async (input) => {
+            creates.push(input)
+            return { id: "child-1" }
+          },
+          prompt: async () => ({ data: { parts: [{ text: "ok" }] } }),
+          messages: async () => ({ data: [{ parts: [{ text: "ok" }] }] }),
+        },
+      },
+    }
+    try {
+      await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: false })
+      expect(creates[0]).toMatchObject({ parentID: "parent-1" })
     } finally {
       await rm(root, { recursive: true, force: true })
     }

@@ -49,7 +49,7 @@ export async function runWorkflow(input: {
     }
   }
 
-  if (run.async) void execute()
+  if (run.async) setTimeout(() => void execute(), 0)
   else await execute()
   return run
 }
@@ -108,6 +108,12 @@ async function executePromptStep(
 ) {
   const settings = resolveStepSettings(workflow.defaults, step)
   const model = settings.model ? parseModel(settings.model) : undefined
+  const prompt = buildStepPrompt(step, settings, run.inputs, state)
+  if (run.async && runtime.client.session.prompt) {
+    await executeSubtaskStep(runtime, tool, workflow, run, step, state, prompt, settings.agent ?? tool.agent ?? "general", model)
+    return
+  }
+
   const session = await runtime.client.session.create({
     parentID: run.parentSessionID,
     title: `workflow:${workflow.id}/${step.id}`,
@@ -121,7 +127,6 @@ async function executePromptStep(
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "running" }
   await saveRun(runtime.worktree, run)
 
-  const prompt = buildStepPrompt(step, settings, run.inputs, state)
   const promptInput: Record<string, unknown> = { sessionID, parts: [{ type: "text", text: prompt }] }
   if (settings.agent) promptInput.agent = settings.agent
   if (model) promptInput.model = model
@@ -131,6 +136,41 @@ async function executePromptStep(
   const promptResult = run.async && runtime.client.session.prompt_async ? await runtime.client.session.prompt_async(promptInput) : await runtime.client.session.prompt?.(promptInput)
   if (!run.async) await runtime.client.session.wait?.({ sessionID })
   const output = (await readSessionOutput(runtime, sessionID)) || extractText(promptResult) || ""
+  run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
+  state[step.id] = { output }
+  await saveRun(runtime.worktree, run)
+}
+
+async function executeSubtaskStep(
+  runtime: RuntimeContext,
+  _tool: ToolRuntimeContext,
+  workflow: Workflow,
+  run: WorkflowRun,
+  step: WorkflowStep,
+  state: Record<string, { output?: string }>,
+  prompt: string,
+  agent: string,
+  model?: { providerID: string; modelID: string },
+) {
+  const description = `workflow:${workflow.id}/${step.id}`
+  const subtaskPart: Record<string, unknown> = {
+    type: "subtask",
+    agent,
+    description,
+    command: "workflow",
+    prompt,
+  }
+  if (model) subtaskPart.model = model
+
+  run.childSessions[step.id] = { stepID: step.id, sessionID: "pending", status: "running" }
+  await saveRun(runtime.worktree, run)
+
+  const result = await runtime.client.session.prompt?.({
+    sessionID: run.parentSessionID,
+    parts: [subtaskPart],
+  })
+  const sessionID = extractTaskSessionID(result) ?? "unknown"
+  const output = extractTaskOutput(result) || extractText(result) || ""
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
   state[step.id] = { output }
   await saveRun(runtime.worktree, run)
@@ -177,8 +217,43 @@ function extractText(input: unknown): string | undefined {
   if (!isRecord(data)) return undefined
   if (typeof data.content === "string") return data.content
   if (typeof data.text === "string") return data.text
+  if (typeof data.output === "string") return data.output
+  if (isRecord(data.state) && typeof data.state.output === "string") return data.state.output
   if (Array.isArray(data.parts)) return data.parts.map(extractText).filter(Boolean).join("\n")
   if (Array.isArray(data.messages)) return data.messages.map(extractText).filter(Boolean).join("\n")
+  return undefined
+}
+
+function extractTaskSessionID(input: unknown): string | undefined {
+  const data = unwrapData(input)
+  const fromMetadata = findStringKey(data, ["sessionId", "sessionID", "jobId"])
+  if (fromMetadata) return fromMetadata
+  const text = extractText(input)
+  return text?.match(/<task id="([^"]+)"/)?.[1]
+}
+
+function extractTaskOutput(input: unknown): string | undefined {
+  const text = extractText(input)
+  return text?.match(/<task_result>\s*([\s\S]*?)\s*<\/task_result>/)?.[1]?.trim()
+}
+
+function findStringKey(input: unknown, keys: string[]): string | undefined {
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      const found = findStringKey(item, keys)
+      if (found) return found
+    }
+    return undefined
+  }
+  if (!isRecord(input)) return undefined
+  for (const key of keys) {
+    const value = input[key]
+    if (typeof value === "string") return value
+  }
+  for (const value of Object.values(input)) {
+    const found = findStringKey(value, keys)
+    if (found) return found
+  }
   return undefined
 }
 

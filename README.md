@@ -219,7 +219,22 @@ Example:
 
 This plugin intentionally does not create detached worker sessions.
 
-Every model-running step calls child session creation with the current session as `parentID`:
+For default async runs, each model-running step is submitted back to the parent session as a `subtask` part. That lets opencode's own task/subagent pipeline create the child session, produce the task notification, and render the child under the parent conversation.
+
+The effective subtask part shape is:
+
+```ts
+{
+  type: "subtask",
+  agent,
+  model,
+  description: `workflow:${workflowID}/${stepID}`,
+  command: "workflow",
+  prompt,
+}
+```
+
+For explicit synchronous runs, the plugin keeps a compatibility fallback that creates a child session directly with the current session as `parentID`:
 
 ```ts
 client.session.create({

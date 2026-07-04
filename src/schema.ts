@@ -51,7 +51,8 @@ Template variables:
 Execution rules:
 
 - workflow action=run defaults to async true unless async is explicitly false.
-- every model-running step must run as a child session attached to the current parent session.
+- async model-running steps are submitted to the parent session as subtask parts, so opencode's own task/subagent pipeline creates the child session, tool notification, and TUI attachment.
+- sync fallback model-running steps create a child session with parentID directly.
 - generated or inline YAML must validate against this shape before execution.
 - agent, model, tools, skills, system, context, and format are optional. Missing values mean use opencode defaults/current session behavior.
 - omitted tools mean "do not override tools"; they do not mean "disable tools".
