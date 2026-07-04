@@ -97,7 +97,7 @@ export type WorkflowRegistry = {
 export type SessionClient = {
   create(input?: Record<string, unknown>): Promise<unknown>
   prompt?(input: Record<string, unknown>): Promise<unknown>
-  prompt_async?(input: Record<string, unknown>): Promise<unknown>
+  promptAsync?(input: Record<string, unknown>): Promise<unknown>
   wait?(input: Record<string, unknown>): Promise<unknown>
   messages?(input: Record<string, unknown>): Promise<unknown>
   abort?(input: Record<string, unknown>): Promise<unknown>

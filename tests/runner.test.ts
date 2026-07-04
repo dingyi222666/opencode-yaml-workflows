@@ -56,8 +56,8 @@ describe("workflow runner", () => {
       const run = await runWorkflow({ runtime, tool, workflow: parseWorkflowYaml(yaml), inputs: { name: "task" }, async: false })
       expect(run.status).toBe("completed")
       expect(creates).toHaveLength(1)
-      expect(creates[0]).toMatchObject({ parentID: "parent-1", title: "workflow:run-me/one", agent: "general" })
-      expect(prompts[0]).toMatchObject({ sessionID: "child-1", tools: { bash: false, grep: true } })
+      expect(creates[0]).toMatchObject({ body: { parentID: "parent-1", title: "workflow:run-me/one" }, query: { directory: root } })
+      expect(prompts[0]).toMatchObject({ path: { id: "child-1" }, query: { directory: root }, body: { agent: "general", tools: { bash: false, grep: true } } })
       expect(JSON.stringify(prompts[0])).toContain("base")
       expect(JSON.stringify(prompts[0])).toContain("extra")
     } finally {
@@ -94,7 +94,7 @@ describe("workflow runner", () => {
       expect(run.async).toBe(true)
       await new Promise((resolve) => setTimeout(resolve, 25))
       expect(creates).toHaveLength(0)
-      expect(prompts[0]).toMatchObject({ sessionID: "parent-1" })
+      expect(prompts[0]).toMatchObject({ path: { id: "parent-1" }, query: { directory: root } })
       expect(JSON.stringify(prompts[0])).toContain('"type":"subtask"')
       expect(JSON.stringify(prompts[0])).toContain("workflow:run-me/one")
       expect(JSON.stringify(prompts)).toContain("parent-1")
@@ -123,7 +123,7 @@ describe("workflow runner", () => {
     }
     try {
       await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: false })
-      expect(creates[0]).toMatchObject({ parentID: "parent-1" })
+      expect(creates[0]).toMatchObject({ body: { parentID: "parent-1" }, query: { directory: root } })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
@@ -164,7 +164,7 @@ steps:
 `
     try {
       await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(noToolsYaml), inputs: {}, async: false })
-      expect(prompts[0]).not.toHaveProperty("tools")
+      expect((prompts[0] as { body?: Record<string, unknown> }).body).not.toHaveProperty("tools")
     } finally {
       await rm(root, { recursive: true, force: true })
     }
