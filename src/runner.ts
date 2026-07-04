@@ -2,6 +2,7 @@ import { createRunID, loadRun, saveRun } from "./persistence.js"
 import { renderTemplate, resolveStepSettings } from "./parser.js"
 import type { RuntimeContext, ToolRuntimeContext, Workflow, WorkflowRun, WorkflowStep } from "./types.js"
 import type { createOpencodeClient } from "@opencode-ai/sdk"
+import type { createOpencodeClient as createOpencodeV2Client } from "@opencode-ai/sdk/v2"
 
 type SDKSession = ReturnType<typeof createOpencodeClient>["session"]
 type SessionAbortInput = Parameters<SDKSession["abort"]>[0]
@@ -10,6 +11,8 @@ type SessionMessagesInput = Parameters<SDKSession["messages"]>[0]
 type SessionPromptInput = Parameters<SDKSession["prompt"]>[0]
 type SessionPromptAsyncInput = Parameters<SDKSession["promptAsync"]>[0]
 type SessionPromptBody = NonNullable<SessionPromptInput["body"]>
+type SDKV2Session = ReturnType<typeof createOpencodeV2Client>["session"]
+type SessionV2CreateInput = NonNullable<Parameters<SDKV2Session["create"]>[0]>
 
 const activeRuns = new Map<string, { cancelled: boolean }>()
 
@@ -21,13 +24,14 @@ export async function runWorkflow(input: {
   async?: boolean
 }) {
   if (!input.tool.sessionID) throw new Error("workflow action=run requires a current parent sessionID")
+  const resolvedInputs = resolveWorkflowInputs(input.workflow, input.inputs)
   const run: WorkflowRun = {
     id: createRunID(),
     workflowID: input.workflow.id,
     parentSessionID: input.tool.sessionID,
     status: "queued",
     async: input.async ?? input.workflow.defaults.async ?? true,
-    inputs: input.inputs,
+    inputs: resolvedInputs,
     childSessions: {},
     logs: [],
     createdAt: new Date().toISOString(),
@@ -155,22 +159,11 @@ async function executePromptStep(
   const settings = resolveStepSettings(workflow.defaults, step)
   const model = settings.model ? parseModel(settings.model) : undefined
   const prompt = buildStepPrompt(step, settings, run.inputs, state)
-  const createInput: SessionCreateInput = {
-    body: { parentID: run.parentSessionID, title: `workflow:${workflow.id}/${step.id}` },
-    query: tool.directory ? { directory: tool.directory } : undefined,
-  }
-  logRun(run, "Creating direct child session", { stepID: step.id, createInput })
-  const session = await runtime.client.session.create(createInput).catch((error) => {
-    throw new Error(`Failed to create child session for step ${step.id}.\nCreate input:\n${safeJson(createInput)}\nError:\n${formatUnknownError(error)}`)
-  })
-  const createEnvelopeError = formatSDKEnvelopeError(session)
-  if (createEnvelopeError) {
-    throw new Error(`Failed to create child session for step ${step.id}.\nCreate input:\n${safeJson(createInput)}\n${createEnvelopeError}`)
-  }
+  const session = await createChildSession(runtime, workflow, run, step, settings.agent)
   const sessionID = extractSessionID(session)
   if (!sessionID) {
     throw new Error(
-      `Failed to create child session for step ${step.id}.\nCreate input:\n${safeJson(createInput)}\nRaw response:\n${safeJson(session)}\nHint: opencode SDK may have returned an error envelope or a shape without data.id/id.`,
+      `Failed to create child session for step ${step.id}.\nRaw response:\n${safeJson(session)}\nHint: opencode SDK may have returned an error envelope or a shape without data.id/id.`,
     )
   }
   logRun(run, "Direct child session created", { stepID: step.id, sessionID })
@@ -182,7 +175,9 @@ async function executePromptStep(
   if (model) promptBody.model = model
   if (Object.keys(settings.tools).length > 0) promptBody.tools = settings.tools
   if (settings.system) promptBody.system = settings.system
-  const promptInput: SessionPromptInput = { path: { id: sessionID }, body: promptBody, query: tool.directory ? { directory: tool.directory } : undefined }
+  const sessionData = unwrapData(session)
+  const sessionDirectory = isRecord(sessionData) && typeof sessionData.directory === "string" ? sessionData.directory : runtime.directory
+  const promptInput: SessionPromptInput = { path: { id: sessionID }, body: promptBody, query: sessionDirectory ? { directory: sessionDirectory } : undefined }
   logRun(run, "Prompting direct child session", { stepID: step.id, promptInput })
   const promptResult = run.async && runtime.client.session.promptAsync
     ? await runtime.client.session.promptAsync(promptInput as SessionPromptAsyncInput)
@@ -196,7 +191,7 @@ async function executePromptStep(
       throw new Error(`Failed to wait for child session for step ${step.id}.\nSession ID: ${sessionID}\nError:\n${formatUnknownError(error)}`)
     })
   }
-  const output = (await readSessionOutput(runtime, sessionID, tool.directory)) || extractText(promptResult) || ""
+  const output = (await readSessionOutput(runtime, sessionID, sessionDirectory)) || extractText(promptResult) || ""
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
   state[step.id] = { output }
   await saveRun(runtime.worktree, run)
@@ -215,6 +210,45 @@ async function readSessionOutput(runtime: RuntimeContext, sessionID: string, dir
   const messagesInput: SessionMessagesInput = { path: { id: sessionID }, query: directory ? { directory } : undefined }
   const messages = await runtime.client.session.messages?.(messagesInput).catch(() => undefined)
   return extractText(messages)
+}
+
+async function createChildSession(
+  runtime: RuntimeContext,
+  workflow: Workflow,
+  run: WorkflowRun,
+  step: WorkflowStep,
+  agent?: string,
+) {
+  const title = `workflow:${workflow.id}/${step.id}`
+  const directory = runtime.directory
+  if (runtime.v2Client) {
+    const createInput: SessionV2CreateInput = {
+      parentID: run.parentSessionID,
+      title,
+      directory,
+      agent,
+      metadata: { workflowID: workflow.id, runID: run.id, stepID: step.id, parentSessionID: run.parentSessionID },
+    }
+    logRun(run, "Creating direct child session via v2 SDK", { stepID: step.id, createInput })
+    const session = await runtime.v2Client.session.create(createInput).catch((error) => {
+      throw new Error(`Failed to create child session for step ${step.id}.\n${formatCreateFailure(createInput, error)}`)
+    })
+    const envelopeError = formatSDKEnvelopeError(session)
+    if (envelopeError) throw new Error(`Failed to create child session for step ${step.id}.\nCreate input:\n${safeJson(createInput)}\n${envelopeError}`)
+    return session
+  }
+
+  const createInput: SessionCreateInput = {
+    body: { parentID: run.parentSessionID, title },
+    query: directory ? { directory } : undefined,
+  }
+  logRun(run, "Creating direct child session via legacy SDK", { stepID: step.id, createInput })
+  const session = await runtime.client.session.create(createInput).catch((error) => {
+    throw new Error(`Failed to create child session for step ${step.id}.\n${formatCreateFailure(createInput, error)}`)
+  })
+  const envelopeError = formatSDKEnvelopeError(session)
+  if (envelopeError) throw new Error(`Failed to create child session for step ${step.id}.\nCreate input:\n${safeJson(createInput)}\n${envelopeError}`)
+  return session
 }
 
 async function wakeParent(runtime: RuntimeContext, run: WorkflowRun) {
@@ -300,7 +334,7 @@ function extractText(input: unknown): string | undefined {
 }
 
 function logRun(run: WorkflowRun, message: string, data?: unknown) {
-  const suffix = data === undefined ? "" : ` ${safeJson(data)}`
+  const suffix = data === undefined ? "" : ` ${safeJson(data, 2_000)}`
   run.logs ??= []
   run.logs.push(`[${new Date().toISOString()}] ${message}${suffix}`)
   run.updatedAt = new Date().toISOString()
@@ -308,8 +342,8 @@ function logRun(run: WorkflowRun, message: string, data?: unknown) {
 
 function formatUnknownError(error: unknown) {
   if (error instanceof Error) {
-    const extra = objectDetails(error)
-    return [error.message, error.stack, extra === "{}" ? undefined : extra].filter(Boolean).join("\n")
+    const stack = typeof error.stack === "string" ? error.stack.split("\n").slice(0, 4).join("\n") : undefined
+    return [error.message, stack].filter(Boolean).join("\n")
   }
   if (typeof error === "object" && error !== null) {
     const details = objectDetails(error)
@@ -324,10 +358,13 @@ function formatSDKEnvelopeError(input: unknown) {
   return [
     "SDK returned an error envelope.",
     `Error: ${formatUnknownError(input.error)}`,
-    `Request: ${safeJson(input.request)}`,
-    `Response: ${safeJson(input.response)}`,
-    `Raw envelope: ${safeJson(input)}`,
+    `Request: ${safeJson(input.request, 1_000)}`,
+    `Response: ${formatResponse(input.response)}`,
   ].join("\n")
+}
+
+function formatCreateFailure(input: unknown, error: unknown) {
+  return [`Create input:`, safeJson(input, 2_000), `Error:`, formatUnknownError(error)].join("\n")
 }
 
 function objectDetails(value: object) {
@@ -335,6 +372,7 @@ function objectDetails(value: object) {
     constructor: value.constructor?.name,
   }
   for (const key of Object.getOwnPropertyNames(value)) {
+    if (key === "stack") continue
     out[key] = (value as Record<string, unknown>)[key]
   }
   for (const [key, current] of Object.entries(value)) {
@@ -343,10 +381,10 @@ function objectDetails(value: object) {
   return safeJson(out)
 }
 
-function safeJson(value: unknown) {
+function safeJson(value: unknown, maxLength = 4_000) {
   const seen = new WeakSet<object>()
   try {
-    return JSON.stringify(
+    const result = JSON.stringify(
       value,
       (_key, current) => {
         if (typeof current === "object" && current !== null) {
@@ -357,9 +395,45 @@ function safeJson(value: unknown) {
       },
       2,
     )
+    return truncate(result, maxLength)
   } catch {
-    return String(value)
+    return truncate(String(value), maxLength)
   }
+}
+
+function formatResponse(input: unknown) {
+  if (!isRecord(input)) return safeJson(input, 1_000)
+  const status = typeof input.status === "number" ? input.status : undefined
+  const statusText = typeof input.statusText === "string" ? input.statusText : undefined
+  const url = typeof input.url === "string" ? input.url : undefined
+  const compact = { status, statusText, url }
+  return safeJson(Object.values(compact).some((value) => value !== undefined) ? compact : input, 1_000)
+}
+
+function truncate(input: string, maxLength: number) {
+  return input.length > maxLength ? `${input.slice(0, maxLength)}…[truncated ${input.length - maxLength} chars]` : input
+}
+
+function resolveWorkflowInputs(workflow: Workflow, input: Record<string, unknown>) {
+  const resolved = { ...input }
+  for (const [name, definition] of Object.entries(workflow.inputs)) {
+    if (resolved[name] === undefined && definition.default !== undefined) resolved[name] = definition.default
+    const value = resolved[name]
+    if (definition.required && (value === undefined || value === null || value === "")) {
+      const provided = Object.keys(input).length ? Object.keys(input).join(", ") : "none"
+      throw new Error(`Missing required workflow input "${name}" for workflow ${workflow.id}. Provided inputs: ${provided}.`)
+    }
+    if (value !== undefined && value !== null && !matchesInputType(value, definition.type ?? "string")) {
+      throw new Error(`Invalid workflow input "${name}" for workflow ${workflow.id}: expected ${definition.type ?? "string"}, got ${Array.isArray(value) ? "array" : typeof value}.`)
+    }
+  }
+  return resolved
+}
+
+function matchesInputType(value: unknown, type: string) {
+  if (type === "array") return Array.isArray(value)
+  if (type === "object") return isRecord(value)
+  return typeof value === type
 }
 
 function unwrapData(input: unknown): unknown {

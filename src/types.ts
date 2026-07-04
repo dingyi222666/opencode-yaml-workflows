@@ -1,4 +1,5 @@
 import type { createOpencodeClient } from "@opencode-ai/sdk"
+import type { createOpencodeClient as createOpencodeV2Client } from "@opencode-ai/sdk/v2"
 
 export type WorkflowInputDefinition = {
   type?: "string" | "number" | "boolean" | "object" | "array"
@@ -102,8 +103,11 @@ export type OpencodeClient = {
   }
 }
 
+export type OpencodeV2Client = ReturnType<typeof createOpencodeV2Client>
+
 export type RuntimeContext = {
   client: OpencodeClient
+  v2Client?: OpencodeV2Client
   directory: string
   worktree: string
 }

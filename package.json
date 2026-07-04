@@ -1,6 +1,6 @@
 {
   "name": "opencode-yaml-workflows",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "YAML workflow plugin for opencode child-session subagents",
   "type": "module",
   "main": "dist/index.js",
@@ -46,6 +46,7 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.15.13",
+    "@opencode-ai/sdk": "^1.15.13",
     "yaml": "^2.8.3"
   },
   "devDependencies": {
