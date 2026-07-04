@@ -1,0 +1,55 @@
+{
+  "name": "opencode-yaml-workflows",
+  "version": "0.1.0",
+  "description": "YAML workflow plugin for opencode child-session subagents",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.zh-CN.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "bun test",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "workflow",
+    "yaml",
+    "subagent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dingyi222666/opencode-yaml-workflows.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dingyi222666/opencode-yaml-workflows/issues"
+  },
+  "homepage": "https://github.com/dingyi222666/opencode-yaml-workflows#readme",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.15.13",
+    "yaml": "^2.8.3"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}
