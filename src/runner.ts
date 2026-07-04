@@ -137,6 +137,9 @@ async function executeStep(
     }
     logRun(run, "Step failed", { stepID: step.id, type: step.type, error: details })
     await saveRun(runtime.worktree, run)
+    if (run.async && existing?.sessionID && existing.sessionID !== "unknown") {
+      await notifyParentTask(runtime, run, step.id, existing.sessionID, "error", details)
+    }
     throw new Error(`Workflow step ${step.id} failed:\n${details}`)
   }
 }
@@ -152,20 +155,6 @@ async function executePromptStep(
   const settings = resolveStepSettings(workflow.defaults, step)
   const model = settings.model ? parseModel(settings.model) : undefined
   const prompt = buildStepPrompt(step, settings, run.inputs, state)
-  if (run.async) {
-    try {
-      await executeSubtaskStep(runtime, tool, workflow, run, step, state, prompt, settings.agent ?? tool.agent ?? "general", model)
-      return
-    } catch (error) {
-      const details = formatUnknownError(error)
-      logRun(run, "Native subtask execution failed", {
-        stepID: step.id,
-        error: details,
-      })
-      throw new Error(`Native subtask execution failed for step ${step.id}. Direct child-session fallback is disabled for async runs because it would not create native opencode task notifications.\n${details}`)
-    }
-  }
-
   const createInput: SessionCreateInput = {
     body: { parentID: run.parentSessionID, title: `workflow:${workflow.id}/${step.id}` },
     query: tool.directory ? { directory: tool.directory } : undefined,
@@ -202,64 +191,16 @@ async function executePromptStep(
   if (promptEnvelopeError) {
     throw new Error(`Failed to prompt child session for step ${step.id}.\nPrompt input:\n${safeJson(promptInput)}\n${promptEnvelopeError}`)
   }
-  if (!run.async) await runtime.client.session.wait?.({ sessionID })
+  if (runtime.client.session.wait) {
+    await runtime.client.session.wait({ sessionID }).catch((error) => {
+      throw new Error(`Failed to wait for child session for step ${step.id}.\nSession ID: ${sessionID}\nError:\n${formatUnknownError(error)}`)
+    })
+  }
   const output = (await readSessionOutput(runtime, sessionID, tool.directory)) || extractText(promptResult) || ""
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
   state[step.id] = { output }
   await saveRun(runtime.worktree, run)
-}
-
-async function executeSubtaskStep(
-  runtime: RuntimeContext,
-  tool: ToolRuntimeContext,
-  workflow: Workflow,
-  run: WorkflowRun,
-  step: WorkflowStep,
-  state: Record<string, { output?: string }>,
-  prompt: string,
-  agent: string,
-  model?: { providerID: string; modelID: string },
-) {
-  if (!runtime.v2Client) {
-    throw new Error("Native subtask execution requires @opencode-ai/sdk/v2 client support.")
-  }
-  const description = `workflow:${workflow.id}/${step.id}`
-
-  run.childSessions[step.id] = { stepID: step.id, sessionID: "pending", status: "running" }
-  await saveRun(runtime.worktree, run)
-
-  const promptText = [
-    `Run workflow step ${description} as native subtask handling.`,
-    `Use agent: ${agent}.`,
-    model ? `Use model: ${model.providerID}/${model.modelID}.` : undefined,
-    "Prompt:",
-    prompt,
-  ]
-    .filter(Boolean)
-    .join("\n\n")
-  const parentPromptInput = {
-    sessionID: run.parentSessionID,
-    prompt: { text: promptText, agents: [{ name: agent }] },
-    delivery: "queue" as const,
-  }
-  logRun(run, "Submitting v2 native subtask prompt to parent session", { stepID: step.id, parentPromptInput })
-  const result = await runtime.v2Client.session.prompt(parentPromptInput).catch((error) => {
-    throw new Error(`Failed to submit v2 native subtask prompt for step ${step.id}.\nPrompt input:\n${safeJson(parentPromptInput)}\nError:\n${formatUnknownError(error)}`)
-  })
-  const envelopeError = formatSDKEnvelopeError(result)
-  if (envelopeError) {
-    throw new Error(`Failed to submit v2 native subtask prompt for step ${step.id}.\nPrompt input:\n${safeJson(parentPromptInput)}\n${envelopeError}`)
-  }
-  const sessionID = extractTaskSessionID(result) ?? "pending"
-  const output = extractTaskOutput(result) || extractText(result) || `Submitted native subtask prompt ${extractAdmittedID(result) ?? ""}`.trim()
-  if (sessionID === "unknown") {
-    logRun(run, "V2 native subtask result did not expose child session id", { stepID: step.id, rawResult: result })
-  } else {
-    logRun(run, "V2 native subtask prompt accepted", { stepID: step.id, sessionID })
-  }
-  run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
-  state[step.id] = { output }
-  await saveRun(runtime.worktree, run)
+  if (run.async) await notifyParentTask(runtime, run, step.id, sessionID, "completed", output)
 }
 
 function buildStepPrompt(step: WorkflowStep, settings: ReturnType<typeof resolveStepSettings>, inputs: Record<string, unknown>, state: Record<string, { output?: string }>) {
@@ -277,8 +218,13 @@ async function readSessionOutput(runtime: RuntimeContext, sessionID: string, dir
 }
 
 async function wakeParent(runtime: RuntimeContext, run: WorkflowRun) {
-  const summary = run.status === "completed" ? run.result || "Workflow completed." : `Workflow ${run.status}: ${run.error ?? "No details."}`
-  const logs = run.logs?.length ? `\n\nWorkflow logs:\n${run.logs.slice(-30).join("\n")}` : ""
+  const childSummary = Object.values(run.childSessions)
+    .map((child) => `- ${child.stepID}: ${child.status} (${child.sessionID})`)
+    .join("\n")
+  const summary = run.status === "completed"
+    ? `Workflow completed.\n\n${childSummary}`
+    : `Workflow ${run.status}: ${run.error ?? "No details."}\n\n${childSummary}`
+  const logs = run.status === "failed" && run.logs?.length ? `\n\nWorkflow logs:\n${run.logs.slice(-10).join("\n")}` : ""
   const wakeInput: SessionPromptInput = {
     path: { id: run.parentSessionID },
     body: { noReply: false, parts: [{ type: "text", synthetic: true, text: `[workflow:${run.workflowID}] run ${run.id} ${run.status}\n\n${summary}${logs}` }] },
@@ -287,6 +233,44 @@ async function wakeParent(runtime: RuntimeContext, run: WorkflowRun) {
   await runtime.client.session
     .prompt?.(wakeInput)
     .catch(() => undefined)
+}
+
+async function notifyParentTask(
+  runtime: RuntimeContext,
+  run: WorkflowRun,
+  stepID: string,
+  sessionID: string,
+  state: "completed" | "error",
+  text: string,
+) {
+  const body = renderTaskNotification({ stepID, sessionID, state, text })
+  const input: SessionPromptInput = {
+    path: { id: run.parentSessionID },
+    body: { noReply: true, parts: [{ type: "text", synthetic: true, text: body }] },
+    query: runtime.directory ? { directory: runtime.directory } : undefined,
+  }
+  logRun(run, "Injecting parent task-like notification", { stepID, sessionID, state })
+  await runtime.client.session.prompt?.(input).catch((error) => {
+    logRun(run, "Failed to inject parent task-like notification", { stepID, sessionID, error: formatUnknownError(error) })
+  })
+}
+
+function renderTaskNotification(input: {
+  stepID: string
+  sessionID: string
+  state: "completed" | "error"
+  text: string
+}) {
+  const tag = input.state === "completed" ? "task_result" : "task_error"
+  const summary = `Workflow step ${input.state === "completed" ? "completed" : "failed"}: ${input.stepID}`
+  return [
+    `<task id="${input.sessionID}" state="${input.state}">`,
+    `<summary>${summary}</summary>`,
+    `<${tag}>`,
+    input.text,
+    `</${tag}>`,
+    "</task>",
+  ].join("\n")
 }
 
 function parseModel(input: string) {
@@ -312,44 +296,6 @@ function extractText(input: unknown): string | undefined {
   if (isRecord(data.state) && typeof data.state.output === "string") return data.state.output
   if (Array.isArray(data.parts)) return data.parts.map(extractText).filter(Boolean).join("\n")
   if (Array.isArray(data.messages)) return data.messages.map(extractText).filter(Boolean).join("\n")
-  return undefined
-}
-
-function extractTaskSessionID(input: unknown): string | undefined {
-  const data = unwrapData(input)
-  const fromMetadata = findStringKey(data, ["sessionId", "sessionID", "jobId"])
-  if (fromMetadata) return fromMetadata
-  const text = extractText(input)
-  return text?.match(/<task id="([^"]+)"/)?.[1]
-}
-
-function extractTaskOutput(input: unknown): string | undefined {
-  const text = extractText(input)
-  return text?.match(/<task_result>\s*([\s\S]*?)\s*<\/task_result>/)?.[1]?.trim()
-}
-
-function extractAdmittedID(input: unknown): string | undefined {
-  const data = unwrapData(input)
-  return findStringKey(data, ["id", "messageID"])
-}
-
-function findStringKey(input: unknown, keys: string[]): string | undefined {
-  if (Array.isArray(input)) {
-    for (const item of input) {
-      const found = findStringKey(item, keys)
-      if (found) return found
-    }
-    return undefined
-  }
-  if (!isRecord(input)) return undefined
-  for (const key of keys) {
-    const value = input[key]
-    if (typeof value === "string") return value
-  }
-  for (const value of Object.values(input)) {
-    const found = findStringKey(value, keys)
-    if (found) return found
-  }
   return undefined
 }
 

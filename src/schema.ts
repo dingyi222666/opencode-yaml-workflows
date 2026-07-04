@@ -51,8 +51,8 @@ Template variables:
 Execution rules:
 
 - workflow action=run defaults to async true unless async is explicitly false.
-- async model-running steps submit a v2 queued prompt to the parent session with agent hints, so opencode can schedule native subtask-style work without legacy prompt re-entry.
-- sync fallback model-running steps create a child session with parentID directly.
+- async model-running steps create real child sessions with parentID, wait for completion in the background, and inject task-like synthetic notifications back into the parent session.
+- sync model-running steps also create child sessions with parentID directly, but do not inject per-step async notifications.
 - generated or inline YAML must validate against this shape before execution.
 - agent, model, tools, skills, system, context, and format are optional. Missing values mean use opencode defaults/current session behavior.
 - omitted tools mean "do not override tools"; they do not mean "disable tools".

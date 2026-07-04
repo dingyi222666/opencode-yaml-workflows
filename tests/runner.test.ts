@@ -11,16 +11,12 @@ import type { OpencodeClient } from "@opencode-ai/sdk"
 type TestSessionClient = Partial<Record<keyof OpencodeClient["session"], (...args: any[]) => any>> & {
   wait?: (input: Record<string, unknown>) => Promise<unknown>
 }
-type TestV2SessionClient = {
-  prompt?: (input: Record<string, unknown>) => Promise<unknown>
-}
 
-function testRuntime(root: string, session: TestSessionClient, v2Session?: TestV2SessionClient): RuntimeContext {
+function testRuntime(root: string, session: TestSessionClient): RuntimeContext {
   return {
     directory: root,
     worktree: root,
     client: { session: session as RuntimeContext["client"]["session"] },
-    v2Client: v2Session ? ({ session: v2Session } as RuntimeContext["v2Client"]) : undefined,
   }
 }
 
@@ -79,8 +75,8 @@ describe("workflow runner", () => {
   test("defaults to async and wakes parent", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
     const prompts: unknown[] = []
-    const v2Prompts: unknown[] = []
     const creates: unknown[] = []
+    const waits: unknown[] = []
     const runtime = testRuntime(root, {
           create: async (input) => {
             creates.push(input)
@@ -90,22 +86,29 @@ describe("workflow runner", () => {
             prompts.push(input)
             return {}
           },
-          messages: async () => ({ data: [{ parts: [{ text: "async output" }] }] }),
-        }, {
-          prompt: async (input) => {
-            v2Prompts.push(input)
-            return { data: { id: "msg-1", sessionID: "parent-1" } }
+          promptAsync: async (input) => {
+            prompts.push(input)
+            return {}
           },
+          wait: async (input) => {
+            waits.push(input)
+            return undefined
+          },
+          messages: async () => ({ data: [{ parts: [{ text: "async output" }] }] }),
         })
     const tool: ToolRuntimeContext = { sessionID: "parent-1", directory: root, worktree: root }
     try {
       const run = await runWorkflow({ runtime, tool, workflow: parseWorkflowYaml(yaml), inputs: {} })
       expect(run.async).toBe(true)
       await new Promise((resolve) => setTimeout(resolve, 25))
-      expect(creates).toHaveLength(0)
-      expect(v2Prompts[0]).toMatchObject({ sessionID: "parent-1", delivery: "queue" })
-      expect(JSON.stringify(v2Prompts[0])).toContain("workflow:run-me/one")
-      expect(JSON.stringify(v2Prompts[0])).toContain('"agents"')
+      expect(creates[0]).toMatchObject({ body: { parentID: "parent-1", title: "workflow:run-me/one" }, query: { directory: root } })
+      expect(prompts[0]).toMatchObject({ path: { id: "child-1" }, query: { directory: root } })
+      expect(waits).toContainEqual({ sessionID: "child-1" })
+      expect(JSON.stringify(prompts)).toContain('<task id=\\"child-1\\" state=\\"completed\\">')
+      expect(JSON.stringify(prompts)).toContain("<task_result>")
+      const stored = await loadRun(root, run.id)
+      expect(stored.result).toContain("async output")
+      expect(stored.childSessions.one).toMatchObject({ sessionID: "child-1", status: "completed", output: "async output" })
       expect(JSON.stringify(prompts)).toContain("parent-1")
       expect(JSON.stringify(prompts)).toContain("workflow:run-me")
     } finally {
@@ -186,13 +189,16 @@ steps:
     }
   })
 
-  test("does not mark v2 native subtask SDK error envelopes as completed", async () => {
+  test("does not mark async child prompt SDK error envelopes as completed", async () => {
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
+    const prompts: unknown[] = []
     const runtime = testRuntime(root, {
-          create: async () => ({ id: "should-not-fallback" }),
-          prompt: async () => ({}),
-        }, {
-          prompt: async () => ({ error: { code: "SESSION_BUSY", message: "session is busy" }, request: { timeout: false }, response: { status: 409 } }),
+          create: async () => ({ id: "child-err" }),
+          prompt: async (input) => {
+            prompts.push(input)
+            return {}
+          },
+          promptAsync: async () => ({ error: { code: "SESSION_BUSY", message: "session is busy" }, request: { timeout: false }, response: { status: 409 } }),
         })
     try {
       const run = await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: true })
@@ -202,9 +208,12 @@ steps:
       expect(stored.status).toBe("failed")
       expect(stored.error).toContain("SESSION_BUSY")
       expect(stored.childSessions.one?.status).toBe("failed")
+      expect(stored.childSessions.one?.sessionID).toBe("child-err")
+      expect(JSON.stringify(prompts)).toContain('<task id=\\"child-err\\" state=\\"error\\">')
+      expect(JSON.stringify(prompts)).toContain("<task_error>")
       const logs = stored.logs?.join("\n") ?? ""
-      expect(logs).toContain("Native subtask execution failed")
-      expect(logs).not.toContain("Creating direct child session")
+      expect(logs).toContain("Creating direct child session")
+      expect(logs).toContain("Injecting parent task-like notification")
     } finally {
       await rm(root, { recursive: true, force: true })
     }

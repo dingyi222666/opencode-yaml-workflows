@@ -219,22 +219,9 @@ steps:
 
 这个插件不会创建游离的 worker 会话。
 
-默认异步执行时，每个模型 step 会作为 `subtask` part 发送回父会话。这样会走 opencode 自己的 task/subagent pipeline，由 opencode 创建子会话、生成 task 通知，并在 TUI 里真正挂到父会话下面。
+默认异步执行时，每个模型 step 都会用当前会话作为 `parentID` 直接创建真实子会话。插件随后在后台等待子会话完成，并用真实子会话 id 向父会话注入 task-like synthetic 通知。
 
-实际 subtask part 形状如下：
-
-```ts
-{
-  type: "subtask",
-  agent,
-  model,
-  description: `workflow:${workflowID}/${stepID}`,
-  command: "workflow",
-  prompt,
-}
-```
-
-显式同步执行时，插件保留兼容 fallback，会用当前会话作为 `parentID` 直接创建子会话：
+子会话创建使用 legacy opencode SDK session API：
 
 ```ts
 client.session.create({
@@ -245,6 +232,19 @@ client.session.create({
   metadata,
 })
 ```
+
+异步 step 通知会使用 task-like 文本，让父会话记录真实子会话 id：
+
+```xml
+<task id="ses_child..." state="completed">
+<summary>Workflow step completed: step-id</summary>
+<task_result>
+...
+</task_result>
+</task>
+```
+
+这不是 opencode 内部 TaskTool live UI，但会保留真实 child-session 关系，并让父会话得到可扫描的完成/失败通知。
 
 如果插件拿不到当前父会话 id，`workflow` 的 `run` action 会直接失败，不会 fallback 到 detached session。
 
@@ -257,7 +257,8 @@ client.session.create({
 - 工具会快速返回 run id。
 - workflow 状态会持久化到 `.opencode/workflows/runs/<run-id>.json`。
 - worker step 会继续在原始父会话下面的子会话里运行。
-- 完成或失败后，插件会向父会话发送一条 plugin-generated completion message。
+- 每个 step 完成或失败后，插件会用真实子会话 id 注入一条 task-like synthetic message。
+- 整体完成或失败后，插件会向父会话发送一条简洁 workflow summary。
 
 只有在希望工具调用等待完成时，才使用 `async: false`。
 

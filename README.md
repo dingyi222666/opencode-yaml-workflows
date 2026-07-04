@@ -219,22 +219,9 @@ Example:
 
 This plugin intentionally does not create detached worker sessions.
 
-For default async runs, each model-running step is submitted back to the parent session as a `subtask` part. That lets opencode's own task/subagent pipeline create the child session, produce the task notification, and render the child under the parent conversation.
+For default async runs, each model-running step creates a real child session directly with the current session as `parentID`. The plugin then waits for the child in the background and injects a task-like synthetic notification back into the parent session using the real child session id.
 
-The effective subtask part shape is:
-
-```ts
-{
-  type: "subtask",
-  agent,
-  model,
-  description: `workflow:${workflowID}/${stepID}`,
-  command: "workflow",
-  prompt,
-}
-```
-
-For explicit synchronous runs, the plugin keeps a compatibility fallback that creates a child session directly with the current session as `parentID`:
+Child session creation uses the legacy opencode SDK session API:
 
 ```ts
 client.session.create({
@@ -245,6 +232,19 @@ client.session.create({
   metadata,
 })
 ```
+
+Async step notifications use task-like text so the parent conversation records the real child session id:
+
+```xml
+<task id="ses_child..." state="completed">
+<summary>Workflow step completed: step-id</summary>
+<task_result>
+...
+</task_result>
+</task>
+```
+
+This is not the internal TaskTool live UI, but it preserves the child-session relationship and gives the parent session a scan-friendly completion/error notification.
 
 If the plugin cannot resolve the current parent session id, `workflow` action `run` fails fast instead of falling back to detached execution.
 
@@ -257,7 +257,8 @@ Async behavior:
 - The tool returns a run id quickly.
 - Workflow state is persisted under `.opencode/workflows/runs/<run-id>.json`.
 - Worker steps continue in child sessions under the original parent session.
-- On completion or failure, the plugin sends a plugin-generated completion message back to the parent session.
+- Each step completion or failure injects a task-like synthetic message with the real child session id.
+- On overall completion or failure, the plugin sends a concise workflow summary back to the parent session.
 
 Use `async: false` only when you want the tool call to wait for completion.
 
