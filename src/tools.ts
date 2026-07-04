@@ -45,7 +45,7 @@ export function createWorkflowTools(runtime: RuntimeContext) {
             const run = await runWorkflow({ runtime, tool: context, workflow, inputs: args.inputs ?? {}, async: args.async })
             return {
               title: `Workflow ${run.id}`,
-              output: run.async ? `Started async workflow run ${run.id}.` : run.result || `Workflow ${run.status}.`,
+              output: formatRunOutput(run),
               metadata: run,
             }
           }
@@ -84,6 +84,15 @@ export function createWorkflowTools(runtime: RuntimeContext) {
       },
     }),
   }
+}
+
+function formatRunOutput(run: { id: string; async: boolean; status: string; result?: string; error?: string; logs?: string[] }) {
+  if (run.async && run.status === "queued") return `Started async workflow run ${run.id}.`
+  if (run.status === "failed") {
+    const logs = run.logs?.length ? `\n\nWorkflow logs:\n${run.logs.slice(-30).join("\n")}` : ""
+    return `Workflow ${run.id} failed.\n\n${run.error ?? "No error details."}${logs}`
+  }
+  return run.result || `Workflow ${run.status}.`
 }
 
 async function resolveWorkflow(runtime: RuntimeContext, context: ToolRuntimeContext, workflowID?: string, yaml?: string): Promise<Workflow> {

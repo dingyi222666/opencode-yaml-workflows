@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { parseWorkflowYaml } from "../src/parser.js"
+import { loadRun } from "../src/persistence.js"
 import { runWorkflow } from "../src/runner.js"
 import type { RuntimeContext, ToolRuntimeContext } from "../src/types.js"
 
@@ -164,6 +165,31 @@ steps:
     try {
       await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(noToolsYaml), inputs: {}, async: false })
       expect(prompts[0]).not.toHaveProperty("tools")
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("records detailed child session creation failures", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
+    const runtime: RuntimeContext = {
+      directory: root,
+      worktree: root,
+      client: {
+        session: {
+          create: async () => ({ error: { code: "NO_AGENT", message: "agent not found" } }),
+          prompt: async () => ({ data: { parts: [{ text: "unused" }] } }),
+        },
+      },
+    }
+    try {
+      const run = await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: false })
+      expect(run.status).toBe("failed")
+      expect(run.error).toContain("Failed to create child session for step one")
+      expect(run.error).toContain("NO_AGENT")
+      const stored = await loadRun(root, run.id)
+      expect(stored.logs?.join("\n")).toContain("Creating direct child session")
+      expect(stored.logs?.join("\n")).toContain("Step failed")
     } finally {
       await rm(root, { recursive: true, force: true })
     }

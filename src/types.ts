@@ -77,6 +77,7 @@ export type WorkflowRun = {
   childSessions: Record<string, WorkflowChildSession>
   result?: string
   error?: string
+  logs?: string[]
   createdAt: string
   updatedAt: string
 }
