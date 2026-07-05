@@ -4,6 +4,7 @@ import { parseWorkflowYaml } from "./parser.js"
 import { loadRun, saveWorkflow } from "./persistence.js"
 import { cancelWorkflow, runWorkflow, statusWorkflow } from "./runner.js"
 import { WORKFLOW_SCHEMA_TEXT } from "./schema.js"
+import { responseLastAssistantText, responsePromptText, responseSessionID } from "./sdk-response.js"
 import type { RuntimeContext, ToolRuntimeContext, Workflow } from "./types.js"
 import type { createOpencodeClient } from "@opencode-ai/sdk/v2"
 
@@ -139,7 +140,7 @@ async function generateWorkflow(runtime: RuntimeContext, context: ToolRuntimeCon
   const model = args.model ? parseModel(args.model) : undefined
   const createInput: SessionCreateInput = { parentID: context.sessionID, title: "workflow:generate", directory: context.directory }
   const session = await runtime.client.session.create(createInput)
-  const sessionID = extractSessionID(session)
+  const sessionID = responseSessionID(session)
   if (!sessionID) throw new Error("Failed to create workflow generation child session")
   const prompt = `Create a valid YAML workflow for this goal. Return only YAML. Goal: ${args.goal}\nSkills: ${(args.skills ?? []).join(", ")}\n\n${WORKFLOW_SCHEMA_TEXT}`
   const promptInput: SessionPromptInput = { sessionID, directory: context.directory, parts: [{ type: "text", text: prompt }] }
@@ -149,7 +150,7 @@ async function generateWorkflow(runtime: RuntimeContext, context: ToolRuntimeCon
   const result = await (runtime.client.session.prompt?.(promptInput) ?? Promise.resolve(undefined))
   await runtime.client.v2.session.wait({ sessionID, directory: context.directory }).catch(() => undefined)
   const messagesInput: SessionMessagesInput = { sessionID, directory: context.directory }
-  const text = extractText(await runtime.client.session.messages?.(messagesInput).catch(() => undefined)) || extractText(result) || ""
+  const text = responseLastAssistantText(await runtime.client.session.messages?.(messagesInput).catch(() => undefined)) || responsePromptText(result) || ""
   const yaml = stripFences(text)
   const workflow = parseWorkflowYaml(yaml)
   if (args.saveAs) await saveWorkflow({ worktree: context.worktree, workflow, location: "project", saveAs: args.saveAs })
@@ -162,32 +163,6 @@ function parseModel(input: string) {
   return providerID && modelID ? { providerID, modelID } : undefined
 }
 
-function extractSessionID(input: unknown): string | undefined {
-  const data = unwrapData(input)
-  return isRecord(data) && typeof data.id === "string" ? data.id : undefined
-}
-
-function extractText(input: unknown): string | undefined {
-  const data = unwrapData(input)
-  if (typeof data === "string") return data
-  if (Array.isArray(data)) return data.map(extractText).filter(Boolean).join("\n")
-  if (!isRecord(data)) return undefined
-  if (typeof data.text === "string") return data.text
-  if (typeof data.content === "string") return data.content
-  if (Array.isArray(data.content)) return data.content.map(extractText).filter(Boolean).join("\n")
-  if (Array.isArray(data.items)) return data.items.map(extractText).filter(Boolean).join("\n")
-  if (Array.isArray(data.parts)) return data.parts.map(extractText).filter(Boolean).join("\n")
-  return undefined
-}
-
 function stripFences(input: string) {
   return input.replace(/^```(?:yaml|yml)?\s*/i, "").replace(/```\s*$/i, "").trim()
-}
-
-function unwrapData(input: unknown): unknown {
-  return isRecord(input) && "data" in input ? input.data : input
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
-  return typeof input === "object" && input !== null
 }

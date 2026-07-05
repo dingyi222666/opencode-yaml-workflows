@@ -1,7 +1,17 @@
 import { parse as parseYaml, stringify } from "yaml"
-import type { StepExecutionSettings, Workflow, WorkflowDefaults, WorkflowStep } from "./types.js"
+import type {
+  JsonObject,
+  StepExecutionSettings,
+  StepType,
+  Workflow,
+  WorkflowDefaults,
+  WorkflowInputDefinition,
+  WorkflowStep,
+  WorkflowValue,
+} from "./types.js"
 
-const STEP_TYPES = new Set(["prompt", "serial", "parallel", "summary", "planner", "loop"])
+const STEP_TYPES: StepType[] = ["prompt", "serial", "parallel", "summary", "planner", "loop"]
+const INPUT_TYPES: Array<NonNullable<WorkflowInputDefinition["type"]>> = ["string", "number", "boolean", "object", "array"]
 
 export class WorkflowValidationError extends Error {
   constructor(message: string) {
@@ -11,31 +21,24 @@ export class WorkflowValidationError extends Error {
 }
 
 export function parseWorkflowYaml(input: string, sourcePath?: string): Workflow {
-  const parsed = parseYaml(input) as unknown
-  return normalizeWorkflow(parsed, sourcePath)
+  return normalizeWorkflow(parseYaml(input), sourcePath)
 }
 
 export function normalizeWorkflow(input: unknown, sourcePath?: string): Workflow {
-  const data = asRecord(input, "workflow")
-  const id = readID(data.id, "workflow.id")
-  const name = readString(data.name, "workflow.name", id)
-  const description = readString(data.description, "workflow.description", "")
-  const trigger = asRecord(data.trigger ?? {}, "workflow.trigger")
-  const defaults = normalizeDefaults(data.defaults ?? {})
-  const stepsInput = Array.isArray(data.steps) ? data.steps : fail("workflow.steps must be an array")
+  const data = object(input, "workflow")
+  const id = safeID(data.id, "workflow.id")
+  const defaults = data.defaults === undefined ? {} : normalizeDefaults(data.defaults, "workflow.defaults")
+  defaults.async ??= true
 
   return {
     id,
-    name,
-    description,
-    trigger: {
-      aliases: readStringArray(trigger.aliases ?? [], "workflow.trigger.aliases"),
-      match: readStringArray(trigger.match ?? [], "workflow.trigger.match"),
-    },
-    defaults: { ...defaults, async: defaults.async ?? true },
-    inputs: normalizeInputs(data.inputs ?? {}),
-    steps: stepsInput.map((step, index) => normalizeStep(step, `workflow.steps[${index}]`)),
-    provenance: isRecord(data.provenance) ? data.provenance : undefined,
+    name: optionalString(data.name, "workflow.name") ?? id,
+    description: optionalString(data.description, "workflow.description") ?? "",
+    trigger: data.trigger === undefined ? undefined : normalizeTrigger(data.trigger),
+    defaults,
+    inputs: data.inputs === undefined ? {} : normalizeInputs(data.inputs),
+    steps: stepArray(data.steps, "workflow.steps"),
+    provenance: data.provenance === undefined ? undefined : jsonObject(data.provenance, "workflow.provenance"),
     sourcePath,
   }
 }
@@ -45,17 +48,15 @@ export function workflowToYaml(workflow: Workflow): string {
   return stringify(plain)
 }
 
-export function renderTemplate(template: string, input: { inputs: Record<string, unknown>; steps: Record<string, { output?: string }> }) {
+export function renderTemplate(template: string, input: { inputs: Record<string, WorkflowValue>; steps: Record<string, { output?: string }> }) {
   return template.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_match, rawPath: string) => {
-    const path = rawPath.trim().split(".")
-    let current: unknown = input as unknown
-    for (const part of path) {
-      if (!isRecord(current)) return ""
+    let current: unknown = input
+    for (const part of rawPath.trim().split(".")) {
+      if (!isObject(current)) return ""
       current = current[part]
     }
     if (current === undefined || current === null) return ""
-    if (typeof current === "string") return current
-    return JSON.stringify(current)
+    return typeof current === "string" ? current : JSON.stringify(current)
   })
 }
 
@@ -72,101 +73,153 @@ export function resolveStepSettings(defaults: WorkflowDefaults, step: WorkflowSt
   }
 }
 
+function normalizeTrigger(input: unknown): Workflow["trigger"] {
+  const data = object(input, "workflow.trigger")
+  return {
+    aliases: data.aliases === undefined ? undefined : stringArray(data.aliases, "workflow.trigger.aliases"),
+    match: data.match === undefined ? undefined : stringArray(data.match, "workflow.trigger.match"),
+  }
+}
+
 function normalizeStep(input: unknown, path: string): WorkflowStep {
-  const data = asRecord(input, path)
-  const id = readID(data.id, `${path}.id`)
-  const typeValue = data.type ?? (typeof data.prompt === "string" ? "prompt" : undefined)
-  const type = typeof typeValue === "string" && STEP_TYPES.has(typeValue) ? (typeValue as WorkflowStep["type"]) : fail(`${path}.type is invalid`)
-  const nested = Array.isArray(data.steps) ? data.steps.map((step, index) => normalizeStep(step, `${path}.steps[${index}]`)) : []
-  const body = Array.isArray(data.body) ? data.body.map((step, index) => normalizeStep(step, `${path}.body[${index}]`)) : nested
-  const planner = data.planner === undefined ? undefined : normalizeStep(data.planner, `${path}.planner`)
+  const data = object(input, path)
+  const id = safeID(data.id, `${path}.id`)
+  const type = stepType(data.type, data.prompt, `${path}.type`)
+  const base = { ...normalizeDefaults(data, path), id }
 
-  if ((type === "prompt" || type === "summary" || type === "planner") && typeof data.prompt !== "string") {
-    fail(`${path}.prompt is required for ${type} steps`)
+  if (type === "prompt" || type === "summary") {
+    return { ...base, type, prompt: requiredString(data.prompt, `${path}.prompt`) }
   }
-  if ((type === "serial" || type === "parallel") && nested.length === 0) {
-    fail(`${path}.steps must contain at least one step`)
+  if (type === "planner") {
+    return {
+      ...base,
+      type,
+      prompt: requiredString(data.prompt, `${path}.prompt`),
+      planner: data.planner === undefined ? undefined : normalizeStep(data.planner, `${path}.planner`),
+    }
   }
-  if (type === "loop" && body.length === 0) fail(`${path}.body or ${path}.steps must contain at least one step`)
-
+  if (type === "serial" || type === "parallel") {
+    return { ...base, type, steps: stepArray(data.steps, `${path}.steps`) }
+  }
   return {
-    ...normalizeDefaults(data),
-    id,
+    ...base,
     type,
-    prompt: typeof data.prompt === "string" ? data.prompt : undefined,
-    steps: nested,
-    planner,
-    body,
-    maxIterations: readNumber(data.maxIterations, `${path}.maxIterations`, 3),
+    steps: data.steps === undefined ? undefined : stepArray(data.steps, `${path}.steps`),
+    body: stepArray(data.body ?? data.steps, data.body === undefined ? `${path}.steps` : `${path}.body`),
+    maxIterations: optionalPositiveInteger(data.maxIterations, `${path}.maxIterations`) ?? 3,
   }
 }
 
-function normalizeDefaults(input: unknown): WorkflowDefaults {
-  const data = asRecord(input, "defaults")
+function normalizeDefaults(input: unknown, path: string): WorkflowDefaults {
+  const data = object(input, path)
   return {
-    agent: typeof data.agent === "string" ? data.agent : undefined,
-    model: typeof data.model === "string" ? data.model : undefined,
-    async: typeof data.async === "boolean" ? data.async : undefined,
-    tools: normalizeBooleanMap(data.tools),
-    skills: readStringArray(data.skills ?? [], "skills"),
-    system: typeof data.system === "string" ? data.system : undefined,
-    context: data.context,
-    format: data.format,
+    agent: optionalString(data.agent, `${path}.agent`),
+    model: optionalString(data.model, `${path}.model`),
+    async: optionalBoolean(data.async, `${path}.async`),
+    tools: data.tools === undefined ? undefined : booleanMap(data.tools, `${path}.tools`),
+    skills: data.skills === undefined ? undefined : stringArray(data.skills, `${path}.skills`),
+    system: optionalString(data.system, `${path}.system`),
+    context: data.context === undefined ? undefined : jsonValue(data.context, `${path}.context`),
+    format: data.format === undefined ? undefined : jsonValue(data.format, `${path}.format`),
   }
 }
 
-function normalizeInputs(input: unknown) {
-  const data = asRecord(input, "workflow.inputs")
+function normalizeInputs(input: unknown): Workflow["inputs"] {
+  const data = object(input, "workflow.inputs")
   const result: Workflow["inputs"] = {}
-  for (const [key, value] of Object.entries(data)) {
-    const definition = asRecord(value ?? {}, `workflow.inputs.${key}`)
-    result[key] = {
-      type: typeof definition.type === "string" ? (definition.type as Workflow["inputs"][string]["type"]) : "string",
-      required: definition.required === true,
-      description: typeof definition.description === "string" ? definition.description : undefined,
-      default: definition.default,
+  for (const [name, raw] of Object.entries(data)) {
+    const item = object(raw, `workflow.inputs.${name}`)
+    const type = item.type === undefined ? "string" : inputType(item.type, `workflow.inputs.${name}.type`)
+    result[name] = {
+      type,
+      required: item.required === undefined ? false : requiredBoolean(item.required, `workflow.inputs.${name}.required`),
+      description: optionalString(item.description, `workflow.inputs.${name}.description`),
+      default: item.default === undefined ? undefined : jsonValue(item.default, `workflow.inputs.${name}.default`),
     }
   }
   return result
 }
 
-function normalizeBooleanMap(input: unknown) {
+function stepArray(input: unknown, path: string) {
+  if (!Array.isArray(input) || input.length === 0) throw new WorkflowValidationError(`${path} must be a non-empty array`)
+  return input.map((step, index) => normalizeStep(step, `${path}[${index}]`))
+}
+
+function booleanMap(input: unknown, path: string) {
+  const data = object(input, path)
+  const result: Record<string, boolean> = {}
+  for (const [key, value] of Object.entries(data)) result[key] = requiredBoolean(value, `${path}.${key}`)
+  return result
+}
+
+function stringArray(input: unknown, path: string) {
+  if (!Array.isArray(input)) throw new WorkflowValidationError(`${path} must be an array`)
+  return input.map((value, index) => requiredString(value, `${path}[${index}]`))
+}
+
+function stepType(input: unknown, prompt: unknown, path: string): StepType {
+  if (input === undefined && typeof prompt === "string") return "prompt"
+  if (typeof input !== "string" || !STEP_TYPES.includes(input as StepType)) throw new WorkflowValidationError(`${path} must be one of: ${STEP_TYPES.join(", ")}`)
+  return input as StepType
+}
+
+function inputType(input: unknown, path: string): WorkflowInputDefinition["type"] {
+  if (typeof input !== "string" || !INPUT_TYPES.includes(input as NonNullable<WorkflowInputDefinition["type"]>)) {
+    throw new WorkflowValidationError(`${path} must be one of: ${INPUT_TYPES.join(", ")}`)
+  }
+  return input as WorkflowInputDefinition["type"]
+}
+
+function safeID(input: unknown, path: string) {
+  const value = requiredString(input, path)
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(value)) throw new WorkflowValidationError(`${path} must be a safe id`)
+  return value
+}
+
+function optionalString(input: unknown, path: string) {
   if (input === undefined) return undefined
-  const data = asRecord(input, "tools")
-  return Object.fromEntries(Object.entries(data).map(([key, value]) => [key, value === true]))
+  return requiredString(input, path)
 }
 
-function readID(input: unknown, path: string) {
-  if (typeof input !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(input)) fail(`${path} must be a safe id`)
+function requiredString(input: unknown, path: string) {
+  if (typeof input !== "string") throw new WorkflowValidationError(`${path} must be a string`)
   return input
 }
 
-function readString(input: unknown, path: string, fallback: string) {
-  if (input === undefined) return fallback
-  if (typeof input !== "string") fail(`${path} must be a string`)
+function optionalBoolean(input: unknown, path: string) {
+  if (input === undefined) return undefined
+  return requiredBoolean(input, path)
+}
+
+function requiredBoolean(input: unknown, path: string) {
+  if (typeof input !== "boolean") throw new WorkflowValidationError(`${path} must be a boolean`)
   return input
 }
 
-function readNumber(input: unknown, path: string, fallback: number) {
-  if (input === undefined) return fallback
-  if (typeof input !== "number" || !Number.isFinite(input)) fail(`${path} must be a number`)
-  return Math.max(1, Math.floor(input))
-}
-
-function readStringArray(input: unknown, path: string) {
-  if (!Array.isArray(input)) fail(`${path} must be an array`)
-  return input.filter((item): item is string => typeof item === "string")
-}
-
-function asRecord(input: unknown, path: string): Record<string, unknown> {
-  if (!isRecord(input)) fail(`${path} must be an object`)
+function optionalPositiveInteger(input: unknown, path: string) {
+  if (input === undefined) return undefined
+  if (typeof input !== "number" || !Number.isInteger(input) || input < 1) throw new WorkflowValidationError(`${path} must be a positive integer`)
   return input
 }
 
-function isRecord(input: unknown): input is Record<string, unknown> {
+function jsonObject(input: unknown, path: string) {
+  const value = jsonValue(input, path)
+  if (!isObject(value)) throw new WorkflowValidationError(`${path} must be an object`)
+  return value
+}
+
+function jsonValue(input: unknown, path: string): WorkflowValue {
+  if (input === null || typeof input === "string" || typeof input === "number" || typeof input === "boolean") return input
+  if (Array.isArray(input)) return input.map((value, index) => jsonValue(value, `${path}[${index}]`))
+  if (isObject(input)) return Object.fromEntries(Object.entries(input).map(([key, value]) => [key, jsonValue(value, `${path}.${key}`)]))
+  throw new WorkflowValidationError(`${path} must be JSON-compatible`)
+}
+
+function object(input: unknown, path: string) {
+  if (!isObject(input)) throw new WorkflowValidationError(`${path} must be an object`)
+  return input
+}
+
+function isObject(input: unknown): input is JsonObject {
   return typeof input === "object" && input !== null && !Array.isArray(input)
-}
-
-function fail(message: string): never {
-  throw new WorkflowValidationError(message)
 }

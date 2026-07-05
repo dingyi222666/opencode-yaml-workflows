@@ -57,10 +57,10 @@ describe("workflow runner", () => {
           },
           prompt: async (input) => {
             prompts.push(input)
-            return { data: { parts: [{ text: "ok" }] } }
+            return { data: { parts: [{ type: "text", text: "ok" }] } }
           },
           wait: async () => undefined,
-          messages: async () => ({ data: [{ parts: [{ text: "child output" }] }] }),
+          messages: async () => ({ data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "child output" }] }] }),
         })
     const tool: ToolRuntimeContext = { sessionID: "parent-1", directory: root, worktree: root }
     try {
@@ -99,7 +99,7 @@ describe("workflow runner", () => {
             waits.push(input)
             return undefined
           },
-          messages: async () => ({ data: [{ parts: [{ text: "async output" }] }] }),
+          messages: async () => ({ data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "async output" }] }] }),
         }, { wait: async (input) => {
           waits.push(input)
           return { error: { _tag: "ServiceUnavailableError", message: "Session wait is not available yet", service: "session.wait" }, request: { timeout: false }, response: { status: 503 } }
@@ -114,9 +114,11 @@ describe("workflow runner", () => {
       expect(JSON.stringify(prompts[0])).toContain(`Target repository directory:\\n${root}`)
       expect(waits).toHaveLength(0)
       expect(prompts[1]).toMatchObject({ sessionID: "parent-1", directory: "/parent/repo", noReply: false })
+      expect(JSON.stringify(prompts[1])).toContain('"synthetic":true')
       expect(JSON.stringify(prompts[1])).toContain("Workflow stage completed: one")
       expect(JSON.stringify(prompts[1])).toContain("workflow is still running")
       expect(prompts[2]).toMatchObject({ sessionID: "parent-1", directory: "/parent/repo", noReply: false })
+      expect(JSON.stringify(prompts[2])).toContain('"synthetic":true')
       expect(JSON.stringify(prompts[2])).toContain("async output")
       expect(JSON.stringify(prompts[1])).not.toContain("Child prompt reached terminal signal")
       expect(JSON.stringify(prompts[1])).not.toContain("<task")
@@ -163,8 +165,8 @@ steps:
             creates.push(input)
             return { id: "child-1" }
           },
-          prompt: async () => ({ data: { parts: [{ text: "ok" }] } }),
-          messages: async () => ({ data: [{ parts: [{ text: "ok" }] }] }),
+          prompt: async () => ({ data: { parts: [{ type: "text", text: "ok" }] } }),
+          messages: async () => ({ data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "ok" }] }] }),
         })
     try {
       await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: false })
@@ -191,9 +193,9 @@ steps:
           create: async () => ({ id: "child-1" }),
           prompt: async (input) => {
             prompts.push(input)
-            return { data: { parts: [{ text: "ok" }] } }
+            return { data: { parts: [{ type: "text", text: "ok" }] } }
           },
-          messages: async () => ({ data: [{ parts: [{ text: "ok" }] }] }),
+          messages: async () => ({ data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "ok" }] }] }),
         })
     const noToolsYaml = `
 id: no-tools
@@ -213,7 +215,7 @@ steps:
     const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
     const runtime = testRuntime(root, {
           create: async () => ({ error: { code: "NO_AGENT", message: "agent not found" } }),
-          prompt: async () => ({ data: { parts: [{ text: "unused" }] } }),
+          prompt: async () => ({ data: { parts: [{ type: "text", text: "unused" }] } }),
         })
     try {
       const run = await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: false })
@@ -284,10 +286,10 @@ steps:
       prompt: async (input) => {
         prompts.push(input)
         if ((input as { sessionID?: string }).sessionID === "child-1") await firstPromptDone
-        return { data: { parts: [{ text: `output-${(input as { sessionID?: string }).sessionID}` }] } }
+        return { data: { parts: [{ type: "text", text: `output-${(input as { sessionID?: string }).sessionID}` }] } }
       },
       promptAsync: async () => ({}),
-      messages: async (input) => ({ data: [{ parts: [{ text: `messages-${(input as { sessionID?: string }).sessionID}` }] }] }),
+      messages: async (input) => ({ data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: `messages-${(input as { sessionID?: string }).sessionID}` }] }] }),
     })
     try {
       const run = await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(serialYaml), inputs: {}, async: true })
@@ -304,6 +306,34 @@ steps:
       expect(stored.result).toContain("messages-child-2")
     } finally {
       resolveFirst?.()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("reads only the last assistant text from child sessions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
+    const prompts: unknown[] = []
+    const runtime = testRuntime(root, {
+      create: async () => ({ id: "child-1" }),
+      prompt: async (input) => {
+        prompts.push(input)
+        return { data: { parts: [{ type: "text", text: "fallback prompt result" }] } }
+      },
+      messages: async () => ({
+        data: [
+          { info: { role: "user" }, parts: [{ type: "text", text: "workflow prompt should not be returned" }] },
+          { info: { role: "assistant" }, parts: [{ type: "tool", state: { output: "tool output should not be returned" } }] },
+          { info: { role: "assistant" }, parts: [{ type: "text", text: "final answer" }] },
+        ],
+      }),
+    })
+    try {
+      const run = await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(yaml), inputs: {}, async: false })
+      const storedRuns = prompts.filter((input) => (input as { sessionID?: string }).sessionID === "child-1")
+      expect(storedRuns).toHaveLength(1)
+      const runFiles = await loadRun(root, run.id)
+      expect(runFiles.childSessions.one?.output).toBe("final answer")
+    } finally {
       await rm(root, { recursive: true, force: true })
     }
   })

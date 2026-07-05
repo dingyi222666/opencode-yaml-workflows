@@ -1,10 +1,13 @@
 import type { createOpencodeClient } from "@opencode-ai/sdk/v2"
 
+export type JsonObject = { [key: string]: WorkflowValue }
+export type WorkflowValue = string | number | boolean | null | WorkflowValue[] | JsonObject
+
 export type WorkflowInputDefinition = {
   type?: "string" | "number" | "boolean" | "object" | "array"
   required?: boolean
   description?: string
-  default?: unknown
+  default?: WorkflowValue
 }
 
 export type WorkflowDefaults = {
@@ -14,36 +17,56 @@ export type WorkflowDefaults = {
   tools?: Record<string, boolean>
   skills?: string[]
   system?: string
-  context?: unknown
-  format?: unknown
+  context?: WorkflowValue
+  format?: WorkflowValue
 }
 
 export type WorkflowTrigger = {
-  aliases: string[]
-  match: string[]
+  aliases?: string[]
+  match?: string[]
 }
 
 export type StepType = "prompt" | "serial" | "parallel" | "summary" | "planner" | "loop"
 
-export type WorkflowStep = WorkflowDefaults & {
+type WorkflowStepBase = WorkflowDefaults & {
   id: string
-  type: StepType
   prompt?: string
-  steps: WorkflowStep[]
+}
+
+export type PromptStep = WorkflowStepBase & {
+  type: "prompt" | "summary"
+  prompt: string
+}
+
+export type PlannerStep = WorkflowStepBase & {
+  type: "planner"
+  prompt: string
   planner?: WorkflowStep
+}
+
+export type SerialStep = WorkflowStepBase & {
+  type: "serial" | "parallel"
+  steps: WorkflowStep[]
+}
+
+export type LoopStep = WorkflowStepBase & {
+  type: "loop"
+  steps?: WorkflowStep[]
   body: WorkflowStep[]
   maxIterations: number
 }
+
+export type WorkflowStep = PromptStep | PlannerStep | SerialStep | LoopStep
 
 export type Workflow = {
   id: string
   name: string
   description: string
-  trigger: WorkflowTrigger
+  trigger?: WorkflowTrigger
   defaults: WorkflowDefaults
   inputs: Record<string, WorkflowInputDefinition>
   steps: WorkflowStep[]
-  provenance?: Record<string, unknown>
+  provenance?: JsonObject
   sourcePath?: string
 }
 
@@ -75,7 +98,7 @@ export type WorkflowRun = {
   parentSessionID: string
   status: WorkflowRunStatus
   async: boolean
-  inputs: Record<string, unknown>
+  inputs: Record<string, WorkflowValue>
   childSessions: Record<string, WorkflowChildSession>
   result?: string
   error?: string
@@ -87,7 +110,7 @@ export type WorkflowRun = {
 export type WorkflowRunRequest = {
   workflowID?: string
   yaml?: string
-  inputs?: Record<string, unknown>
+  inputs?: Record<string, WorkflowValue>
   async?: boolean
 }
 

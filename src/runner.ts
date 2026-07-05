@@ -1,6 +1,7 @@
 import { createRunID, loadRun, saveRun } from "./persistence.js"
 import { renderTemplate, resolveStepSettings } from "./parser.js"
-import type { RuntimeContext, ToolRuntimeContext, Workflow, WorkflowRun, WorkflowStep } from "./types.js"
+import { responseLastAssistantText, responsePromptText, responseSessionDirectory, responseSessionID } from "./sdk-response.js"
+import type { JsonObject, RuntimeContext, ToolRuntimeContext, Workflow, WorkflowRun, WorkflowStep, WorkflowValue } from "./types.js"
 import type { createOpencodeClient } from "@opencode-ai/sdk/v2"
 
 type SDKSession = ReturnType<typeof createOpencodeClient>["session"]
@@ -21,7 +22,7 @@ export async function runWorkflow(input: {
   runtime: RuntimeContext
   tool: ToolRuntimeContext
   workflow: Workflow
-  inputs: Record<string, unknown>
+  inputs: Record<string, WorkflowValue>
   async?: boolean
 }) {
   if (!input.tool.sessionID) throw new Error("workflow action=run requires a current parent sessionID")
@@ -52,7 +53,7 @@ export async function runWorkflow(input: {
       run.status = "running"
       logRun(run, "Workflow run started", { workflowID: input.workflow.id, steps: input.workflow.steps.map((step) => step.id) })
       await saveRun(input.runtime.worktree, run)
-      const state: Record<string, { output?: string }> = {}
+      const state: WorkflowStepState = {}
       for (const step of input.workflow.steps) await executeStep(input.runtime, input.tool, input.workflow, run, step, state, token)
       run.status = token.cancelled ? "cancelled" : "completed"
       run.result = Object.entries(state)
@@ -104,7 +105,7 @@ async function executeStep(
   workflow: Workflow,
   run: WorkflowRun,
   step: WorkflowStep,
-  state: Record<string, { output?: string }>,
+  state: WorkflowStepState,
   token: { cancelled: boolean },
 ) {
   if (token.cancelled) throw new Error("Workflow run cancelled")
@@ -152,7 +153,7 @@ async function executePromptStepWithRetries(
   workflow: Workflow,
   run: WorkflowRun,
   step: WorkflowStep,
-  state: Record<string, { output?: string }>,
+  state: WorkflowStepState,
 ) {
   let lastError: Error | undefined
   for (let attempt = 1; attempt <= STEP_OUTPUT_MAX_ATTEMPTS; attempt++) {
@@ -175,7 +176,7 @@ async function executePromptStep(
   workflow: Workflow,
   run: WorkflowRun,
   step: WorkflowStep,
-  state: Record<string, { output?: string }>,
+  state: WorkflowStepState,
   attempt: number,
 ) {
   const settings = resolveStepSettings(workflow.defaults, step)
@@ -184,7 +185,7 @@ async function executePromptStep(
   const targetDirectory = runtime.directory
   const prompt = buildStepPrompt(step, settings, run.inputs, state, { parentDirectory, targetDirectory })
   const session = await createChildSession(runtime, workflow, run, step, parentDirectory, settings.agent)
-  const sessionID = extractSessionID(session)
+  const sessionID = responseSessionID(session)
   if (!sessionID) {
     throw new Error(
       `Failed to create child session for step ${step.id}.\nRaw response:\n${safeJson(session)}\nHint: opencode SDK may have returned an error envelope or a shape without data.id/id.`,
@@ -194,16 +195,15 @@ async function executePromptStep(
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "running" }
   await saveRun(runtime.worktree, run)
 
-  const sessionData = unwrapData(session)
-  const sessionDirectory = isRecord(sessionData) && typeof sessionData.directory === "string" ? sessionData.directory : parentDirectory
-  const promptInput: SessionPromptInput = { sessionID, directory: sessionDirectory, parts: [{ type: "text", text: prompt }] }
+  const childDirectory = responseSessionDirectory(session) ?? parentDirectory
+  const promptInput: SessionPromptInput = { sessionID, directory: childDirectory, parts: [{ type: "text", text: prompt }] }
   if (settings.agent) promptInput.agent = settings.agent
   if (model) promptInput.model = model
   if (Object.keys(settings.tools).length > 0) promptInput.tools = settings.tools
   if (settings.system) promptInput.system = settings.system
   logRun(run, "Prompting direct child session", { stepID: step.id, attempt, sessionID })
-  const promptResult = await waitForChildPrompt(runtime, run, sessionID, sessionDirectory, step.id, promptInput)
-  const output = normalizeOutput((await readSessionOutput(runtime, sessionID, sessionDirectory)) || extractText(promptResult) || "")
+  const promptResult = await waitForChildPrompt(runtime, run, sessionID, childDirectory, step.id, promptInput)
+  const output = normalizeOutput((await readSessionOutput(runtime, sessionID, childDirectory)) || responsePromptText(promptResult) || "")
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
   state[step.id] = { output }
   await saveRun(runtime.worktree, run)
@@ -214,8 +214,8 @@ async function executePromptStep(
 function buildStepPrompt(
   step: WorkflowStep,
   settings: ReturnType<typeof resolveStepSettings>,
-  inputs: Record<string, unknown>,
-  state: Record<string, { output?: string }>,
+  inputs: Record<string, WorkflowValue>,
+  state: WorkflowStepState,
   execution?: { parentDirectory?: string; targetDirectory?: string },
 ) {
   const sections = []
@@ -231,7 +231,7 @@ function buildStepPrompt(
 async function readSessionOutput(runtime: RuntimeContext, sessionID: string, directory?: string) {
   const messagesInput: SessionMessagesInput = { sessionID, directory }
   const messages = await runtime.client.session.messages?.(messagesInput).catch(() => undefined)
-  return extractText(messages)
+  return responseLastAssistantText(messages)
 }
 
 async function createChildSession(
@@ -269,8 +269,8 @@ async function resolveParentSessionDirectory(runtime: RuntimeContext, parentSess
     const result = await getSession(input).catch(() => undefined)
     const envelopeError = formatSDKEnvelopeError(result)
     if (envelopeError) continue
-    const data = unwrapData(result)
-    if (isRecord(data) && typeof data.directory === "string") return data.directory
+    const directoryValue = responseSessionDirectory(result)
+    if (directoryValue) return directoryValue
   }
   return runtime.directory
 }
@@ -310,7 +310,7 @@ async function wakeParent(runtime: RuntimeContext, workflow: Workflow, run: Work
     sessionID: run.parentSessionID,
     directory: parentDirectory,
     noReply: false,
-    parts: [{ type: "text", text: summary }],
+    parts: [{ type: "text", synthetic: true, text: summary }],
   }
   await runtime.client.session
     .prompt?.(wakeInput)
@@ -326,6 +326,7 @@ async function notifyParentStepCompleted(runtime: RuntimeContext, run: WorkflowR
     parts: [
       {
         type: "text",
+        synthetic: true,
         text: `Workflow stage completed: ${stepID}.\n\nThe workflow is still running. I will send the final output when all stages finish.`,
       },
     ],
@@ -395,28 +396,6 @@ function parseModel(input: string) {
   return providerID && modelID ? { providerID, modelID } : undefined
 }
 
-function extractSessionID(input: unknown): string | undefined {
-  const data = unwrapData(input)
-  if (isRecord(data) && typeof data.id === "string") return data.id
-  return undefined
-}
-
-function extractText(input: unknown): string | undefined {
-  const data = unwrapData(input)
-  if (typeof data === "string") return data
-  if (Array.isArray(data)) return data.map(extractText).filter(Boolean).join("\n")
-  if (!isRecord(data)) return undefined
-  if (typeof data.content === "string") return data.content
-  if (typeof data.text === "string") return data.text
-  if (typeof data.output === "string") return data.output
-  if (isRecord(data.state) && typeof data.state.output === "string") return data.state.output
-  if (Array.isArray(data.content)) return data.content.map(extractText).filter(Boolean).join("\n")
-  if (Array.isArray(data.items)) return data.items.map(extractText).filter(Boolean).join("\n")
-  if (Array.isArray(data.parts)) return data.parts.map(extractText).filter(Boolean).join("\n")
-  if (Array.isArray(data.messages)) return data.messages.map(extractText).filter(Boolean).join("\n")
-  return undefined
-}
-
 function logRun(run: WorkflowRun, message: string, data?: unknown) {
   const suffix = data === undefined ? "" : ` ${safeJson(data, 2_000)}`
   run.logs ??= []
@@ -472,12 +451,12 @@ function formatCreateFailure(input: unknown, error: unknown) {
 }
 
 function objectDetails(value: object) {
-  const out: Record<string, unknown> = {
+  const out: JsonObject = {
     constructor: value.constructor?.name,
   }
   for (const key of Object.getOwnPropertyNames(value)) {
     if (key === "stack") continue
-    out[key] = (value as Record<string, unknown>)[key]
+    out[key] = Object.getOwnPropertyDescriptor(value, key)?.value
   }
   for (const [key, current] of Object.entries(value)) {
     out[key] = current
@@ -518,7 +497,9 @@ function truncate(input: string, maxLength: number) {
   return input.length > maxLength ? `${input.slice(0, maxLength)}…[truncated ${input.length - maxLength} chars]` : input
 }
 
-function resolveWorkflowInputs(workflow: Workflow, input: Record<string, unknown>) {
+type WorkflowStepState = Record<string, { output?: string }>
+
+function resolveWorkflowInputs(workflow: Workflow, input: Record<string, WorkflowValue>) {
   const resolved = { ...input }
   for (const [name, definition] of Object.entries(workflow.inputs)) {
     if (resolved[name] === undefined && definition.default !== undefined) resolved[name] = definition.default
@@ -550,16 +531,12 @@ function formatWorkflowInputContract(workflow: Workflow) {
   ].join("\n")
 }
 
-function matchesInputType(value: unknown, type: string) {
+function matchesInputType(value: WorkflowValue, type: string) {
   if (type === "array") return Array.isArray(value)
   if (type === "object") return isRecord(value)
   return typeof value === type
 }
 
-function unwrapData(input: unknown): unknown {
-  return isRecord(input) && "data" in input ? input.data : input
-}
-
-function isRecord(input: unknown): input is Record<string, unknown> {
+function isRecord(input: unknown): input is JsonObject {
   return typeof input === "object" && input !== null
 }
