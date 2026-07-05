@@ -11,7 +11,9 @@ type SessionMessagesInput = Parameters<SDKSession["messages"]>[0]
 type SessionPromptInput = Parameters<SDKSession["prompt"]>[0]
 
 const CHILD_SESSION_TIMEOUT_MS = 15 * 60 * 1000
-const PARENT_NOTIFICATION_TIMEOUT_MS = 5_000
+const PARENT_STAGE_NOTIFICATION_TIMEOUT_MS = 5_000
+const STEP_OUTPUT_MAX_ATTEMPTS = 3
+const WAKE_OUTPUT_MAX_STEPS = 3
 
 const activeRuns = new Map<string, { cancelled: boolean }>()
 
@@ -57,14 +59,14 @@ export async function runWorkflow(input: {
         .map(([id, value]) => `## ${id}\n${value.output ?? ""}`)
         .join("\n\n")
       await saveRun(input.runtime.worktree, run)
-      if (run.async && run.status === "completed") await wakeParent(input.runtime, run)
+      if (run.async && run.status === "completed") await wakeParent(input.runtime, input.workflow, run)
     } catch (error) {
       const details = formatUnknownError(error)
       run.status = token.cancelled ? "cancelled" : "failed"
       run.error = details
       logRun(run, "Workflow run failed", { error: details })
       await saveRun(input.runtime.worktree, run)
-      if (run.async) await wakeParent(input.runtime, run)
+      if (run.async) await wakeParent(input.runtime, input.workflow, run)
     } finally {
       activeRuns.delete(run.id)
     }
@@ -126,7 +128,7 @@ async function executeStep(
       logRun(run, "Step completed", { stepID: step.id, type: step.type })
       return
     }
-    await executePromptStep(runtime, tool, workflow, run, step, state)
+    await executePromptStepWithRetries(runtime, tool, workflow, run, step, state)
     logRun(run, "Step completed", { stepID: step.id, type: step.type })
   } catch (error) {
     const details = formatUnknownError(error)
@@ -140,11 +142,31 @@ async function executeStep(
     }
     logRun(run, "Step failed", { stepID: step.id, type: step.type, error: details })
     await saveRun(runtime.worktree, run)
-    if (run.async && existing?.sessionID && existing.sessionID !== "unknown") {
-      await notifyParentTask(runtime, run, step.id, existing.sessionID, "error", details)
-    }
     throw new Error(`Workflow step ${step.id} failed:\n${details}`)
   }
+}
+
+async function executePromptStepWithRetries(
+  runtime: RuntimeContext,
+  tool: ToolRuntimeContext,
+  workflow: Workflow,
+  run: WorkflowRun,
+  step: WorkflowStep,
+  state: Record<string, { output?: string }>,
+) {
+  let lastError: Error | undefined
+  for (let attempt = 1; attempt <= STEP_OUTPUT_MAX_ATTEMPTS; attempt++) {
+    try {
+      const output = await executePromptStep(runtime, tool, workflow, run, step, state, attempt)
+      if (isUsableOutput(output)) return
+      lastError = new Error(`Workflow step ${step.id} returned empty output on attempt ${attempt}`)
+      logRun(run, "Step returned empty output", { stepID: step.id, attempt, maxAttempts: STEP_OUTPUT_MAX_ATTEMPTS })
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(formatUnknownError(error))
+      logRun(run, "Step attempt failed", { stepID: step.id, attempt, maxAttempts: STEP_OUTPUT_MAX_ATTEMPTS, error: formatUnknownError(error) })
+    }
+  }
+  throw lastError ?? new Error(`Workflow step ${step.id} did not return usable output`)
 }
 
 async function executePromptStep(
@@ -154,6 +176,7 @@ async function executePromptStep(
   run: WorkflowRun,
   step: WorkflowStep,
   state: Record<string, { output?: string }>,
+  attempt: number,
 ) {
   const settings = resolveStepSettings(workflow.defaults, step)
   const model = settings.model ? parseModel(settings.model) : undefined
@@ -167,10 +190,9 @@ async function executePromptStep(
       `Failed to create child session for step ${step.id}.\nRaw response:\n${safeJson(session)}\nHint: opencode SDK may have returned an error envelope or a shape without data.id/id.`,
     )
   }
-  logRun(run, "Direct child session created", { stepID: step.id, sessionID })
+  logRun(run, "Direct child session created", { stepID: step.id, sessionID, attempt })
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "running" }
   await saveRun(runtime.worktree, run)
-  if (run.async) await notifyParentTask(runtime, run, step.id, sessionID, "running", `Workflow step started: ${step.id}`)
 
   const sessionData = unwrapData(session)
   const sessionDirectory = isRecord(sessionData) && typeof sessionData.directory === "string" ? sessionData.directory : parentDirectory
@@ -179,13 +201,14 @@ async function executePromptStep(
   if (model) promptInput.model = model
   if (Object.keys(settings.tools).length > 0) promptInput.tools = settings.tools
   if (settings.system) promptInput.system = settings.system
-  logRun(run, "Prompting direct child session", { stepID: step.id, promptInput })
+  logRun(run, "Prompting direct child session", { stepID: step.id, attempt, sessionID })
   const promptResult = await waitForChildPrompt(runtime, run, sessionID, sessionDirectory, step.id, promptInput)
-  const output = (await readSessionOutput(runtime, sessionID, sessionDirectory)) || extractText(promptResult) || ""
+  const output = normalizeOutput((await readSessionOutput(runtime, sessionID, sessionDirectory)) || extractText(promptResult) || "")
   run.childSessions[step.id] = { stepID: step.id, sessionID, status: "completed", output }
   state[step.id] = { output }
   await saveRun(runtime.worktree, run)
-  if (run.async) await notifyParentTask(runtime, run, step.id, sessionID, "completed", output)
+  if (run.async && isUsableOutput(output)) await notifyParentStepCompleted(runtime, run, step.id)
+  return output
 }
 
 function buildStepPrompt(
@@ -272,7 +295,6 @@ async function waitForChildPrompt(
     if (envelopeError) throw new Error(`Failed to prompt child session for step ${stepID}.\nPrompt input:\n${safeJson(promptInput)}\n${envelopeError}`)
     return result
   } catch (error) {
-    await notifyParentTask(runtime, run, stepID, sessionID, "error", formatUnknownError(error))
     throw error
   } finally {
     if (timeout) clearTimeout(timeout)
@@ -280,77 +302,91 @@ async function waitForChildPrompt(
   }
 }
 
-async function wakeParent(runtime: RuntimeContext, run: WorkflowRun) {
-  const childSummary = Object.values(run.childSessions)
-    .map((child) => `- ${child.stepID}: ${child.status} (${child.sessionID})`)
-    .join("\n")
-  const summary = run.status === "completed"
-    ? `Workflow completed.\n\n${childSummary}`
-    : `Workflow ${run.status}: ${run.error ?? "No details."}\n\n${childSummary}`
-  const logs = run.status === "failed" && run.logs?.length ? `\n\nWorkflow logs:\n${run.logs.slice(-10).join("\n")}` : ""
+async function wakeParent(runtime: RuntimeContext, workflow: Workflow, run: WorkflowRun) {
+  const output = renderWakeOutput(workflow, run)
+  const summary = run.status === "completed" ? output : output || `Workflow ${run.status}.`
   const parentDirectory = await resolveParentSessionDirectory(runtime, run.parentSessionID)
   const wakeInput: SessionPromptInput = {
     sessionID: run.parentSessionID,
     directory: parentDirectory,
     noReply: false,
-    parts: [{ type: "text", synthetic: true, text: `[workflow:${run.workflowID}] run ${run.id} ${run.status}\n\n${summary}${logs}` }],
+    parts: [{ type: "text", text: summary }],
   }
   await runtime.client.session
     .prompt?.(wakeInput)
     .catch(() => undefined)
 }
 
-async function notifyParentTask(
-  runtime: RuntimeContext,
-  run: WorkflowRun,
-  stepID: string,
-  sessionID: string,
-  state: "running" | "completed" | "error",
-  text: string,
-) {
-  const body = renderTaskNotification({ stepID, sessionID, state, text })
+async function notifyParentStepCompleted(runtime: RuntimeContext, run: WorkflowRun, stepID: string) {
   const parentDirectory = await resolveParentSessionDirectory(runtime, run.parentSessionID)
   const input: SessionPromptInput = {
     sessionID: run.parentSessionID,
     directory: parentDirectory,
-    noReply: true,
-    parts: [{ type: "text", synthetic: true, text: body }],
+    noReply: false,
+    parts: [
+      {
+        type: "text",
+        text: `Workflow stage completed: ${stepID}.\n\nThe workflow is still running. I will send the final output when all stages finish.`,
+      },
+    ],
   }
-  logRun(run, "Injecting parent task-like notification", { stepID, sessionID, state })
   let timeout: ReturnType<typeof setTimeout> | undefined
   try {
-    const send = runtime.client.session.promptAsync?.bind(runtime.client.session) ?? runtime.client.session.prompt.bind(runtime.client.session)
     const result = await Promise.race([
-      send(input),
+      runtime.client.session.prompt(input),
       new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(`parent notification timed out after ${PARENT_NOTIFICATION_TIMEOUT_MS}ms`)), PARENT_NOTIFICATION_TIMEOUT_MS)
+        timeout = setTimeout(() => reject(new Error(`parent stage notification timed out after ${PARENT_STAGE_NOTIFICATION_TIMEOUT_MS}ms`)), PARENT_STAGE_NOTIFICATION_TIMEOUT_MS)
       }),
     ])
     const envelopeError = formatSDKEnvelopeError(result)
     if (envelopeError) throw new Error(envelopeError)
   } catch (error) {
-    logRun(run, "Queued parent task-like notification after send failure", { stepID, sessionID, state, notification: body, error: formatUnknownError(error) })
+    logRun(run, "Parent stage completion notification failed", { stepID, error: formatUnknownError(error) })
   } finally {
     if (timeout) clearTimeout(timeout)
   }
 }
 
-function renderTaskNotification(input: {
-  stepID: string
-  sessionID: string
-  state: "running" | "completed" | "error"
-  text: string
-}) {
-  const tag = input.state === "error" ? "task_error" : "task_result"
-  const summary = `Workflow step ${input.state === "completed" ? "completed" : input.state === "running" ? "started" : "failed"}: ${input.stepID}`
-  return [
-    `<task id="${input.sessionID}" state="${input.state}">`,
-    `<summary>${summary}</summary>`,
-    `<${tag}>`,
-    input.text,
-    `</${tag}>`,
-    "</task>",
-  ].join("\n")
+function renderWakeOutput(workflow: Workflow, run: WorkflowRun) {
+  if (run.status !== "completed") return renderFailureOutput(run)
+  const ordered = collectPromptStepIDs(workflow.steps)
+    .map((stepID) => run.childSessions[stepID])
+    .filter((child) => child?.status === "completed" && isUsableOutput(child.output))
+  const preferred = ordered.filter((child) => isFinalOutputStep(child.stepID))
+  const selected = (preferred.length ? preferred : ordered).slice(-WAKE_OUTPUT_MAX_STEPS)
+  if (!selected.length) return "No workflow output was produced."
+  if (selected.length === 1) return normalizeOutput(selected[0]?.output ?? "")
+  return selected.map((child) => `## ${child.stepID}\n${normalizeOutput(child.output ?? "")}`).join("\n\n")
+}
+
+function renderFailureOutput(run: WorkflowRun) {
+  const failed = Object.values(run.childSessions).find((child) => child.status === "failed" && child.error)
+  const error = failed?.error ?? run.error
+  if (!error) return ""
+  return `## ${failed?.stepID ?? "error"}\n${compactError(error)}`
+}
+
+function collectPromptStepIDs(steps: WorkflowStep[]): string[] {
+  const ids: string[] = []
+  for (const step of steps) {
+    if (step.type === "serial" || step.type === "parallel") ids.push(...collectPromptStepIDs(step.steps))
+    else if (step.type === "loop") ids.push(...collectPromptStepIDs(step.body))
+    else ids.push(step.id)
+  }
+  return ids
+}
+
+function isFinalOutputStep(stepID: string) {
+  return /(^|[-_])(final|summary|summarize|result|report|answer)([-_]|$)/i.test(stepID)
+}
+
+function normalizeOutput(input: string) {
+  return input.replace(/\u00a0/g, " ").trim()
+}
+
+function isUsableOutput(input: string | undefined) {
+  if (!input) return false
+  return input.replace(/\s/g, "").length > 0
 }
 
 function parseModel(input: string) {
@@ -399,6 +435,26 @@ function formatUnknownError(error: unknown) {
     return details === "{}" ? asString : details
   }
   return safeJson(error)
+}
+
+function compactError(input: string) {
+  const code = input.match(/"code"\s*:\s*"([^"]+)"/)?.[1]
+  const message = input.match(/"message"\s*:\s*"([^"]+)"/)?.[1]
+  if (code || message) return [code, message].filter(Boolean).join(": ")
+
+  const withoutDebugBlocks = input.split(/\n(?:Prompt input:|Create input:|Request:|Response:)/)[0] ?? input
+  return input
+    .replace(input, withoutDebugBlocks)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^at\s+/.test(line))
+    .filter((line) => !line.startsWith("Create input:"))
+    .filter((line) => !line.startsWith("Prompt input:"))
+    .filter((line) => !line.startsWith("Request:"))
+    .filter((line) => !line.startsWith("Response:"))
+    .slice(0, 4)
+    .join("\n")
 }
 
 function formatSDKEnvelopeError(input: unknown) {
