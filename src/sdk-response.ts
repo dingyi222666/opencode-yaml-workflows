@@ -19,6 +19,13 @@ export function responseSessionDirectory(input: Envelope<{ directory?: string }>
   return responseData(input)?.directory
 }
 
+export function responseSessionModel(input: Envelope<{ model?: { providerID?: string; id?: string; modelID?: string } }> | undefined) {
+  const model = responseData(input)?.model
+  const providerID = model?.providerID
+  const modelID = model?.modelID ?? model?.id
+  return providerID && modelID ? { providerID, modelID } : undefined
+}
+
 export function responsePromptText(input: Envelope<SessionPromptResponse> | undefined) {
   return lastTextPart(responseData(input)?.parts)
 }

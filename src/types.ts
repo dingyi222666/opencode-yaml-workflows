@@ -120,6 +120,7 @@ export type WorkflowRegistry = {
 }
 
 export type OpencodeClient = {
+  app: ReturnType<typeof createOpencodeClient>["app"]
   session: ReturnType<typeof createOpencodeClient>["session"]
   v2: ReturnType<typeof createOpencodeClient>["v2"]
 }

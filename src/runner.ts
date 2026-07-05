@@ -1,6 +1,6 @@
 import { createRunID, loadRun, saveRun } from "./persistence.js"
 import { renderTemplate, resolveStepSettings } from "./parser.js"
-import { responseLastAssistantText, responsePromptText, responseSessionDirectory, responseSessionID } from "./sdk-response.js"
+import { responseData, responseLastAssistantText, responsePromptText, responseSessionDirectory, responseSessionID, responseSessionModel } from "./sdk-response.js"
 import type { JsonObject, RuntimeContext, ToolRuntimeContext, Workflow, WorkflowRun, WorkflowStep, WorkflowValue } from "./types.js"
 import type { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import type { PermissionRule } from "@opencode-ai/sdk/v2/client"
@@ -11,6 +11,7 @@ type SessionCreateInput = NonNullable<Parameters<SDKSession["create"]>[0]>
 type SessionGetInput = Parameters<SDKSession["get"]>[0]
 type SessionMessagesInput = Parameters<SDKSession["messages"]>[0]
 type SessionPromptInput = Parameters<SDKSession["prompt"]>[0]
+type SessionPromptModel = NonNullable<SessionPromptInput["model"]>
 
 const CHILD_SESSION_TIMEOUT_MS = 15 * 60 * 1000
 const PARENT_STAGE_NOTIFICATION_TIMEOUT_MS = 5_000
@@ -186,8 +187,8 @@ async function executePromptStep(
   attempt: number,
 ) {
   const settings = resolveStepSettings(workflow.defaults, step)
-  const model = settings.model ? parseModel(settings.model) : undefined
   const parentDirectory = await resolveParentSessionDirectory(runtime, run.parentSessionID)
+  const model = await resolvePromptModel(runtime, run.parentSessionID, parentDirectory, settings.model, settings.agent)
   const targetDirectory = runtime.directory
   const prompt = buildStepPrompt(step, settings, run.inputs, state, { parentDirectory, targetDirectory })
   const session = await createChildSession(runtime, workflow, run, step, parentDirectory, settings.agent)
@@ -397,7 +398,36 @@ function isUsableOutput(input: string | undefined) {
   return input.replace(/\s/g, "").length > 0
 }
 
-function parseModel(input: string) {
+async function resolvePromptModel(runtime: RuntimeContext, parentSessionID: string, parentDirectory: string, explicitModel?: string, agent?: string): Promise<SessionPromptModel | undefined> {
+  const parsed = explicitModel ? parseModel(explicitModel) : undefined
+  if (parsed) return parsed
+  const agentModel = agent ? await resolveAgentModel(runtime, parentDirectory, agent) : undefined
+  if (agentModel) return agentModel
+  return resolveParentSessionModel(runtime, parentSessionID, parentDirectory)
+}
+
+async function resolveAgentModel(runtime: RuntimeContext, directory: string, agent: string): Promise<SessionPromptModel | undefined> {
+  const agents = await runtime.client.app.agents({ directory }).catch(() => undefined)
+  const list = responseData(agents) ?? []
+  return list.find((item) => item.name === agent)?.model
+}
+
+async function resolveParentSessionModel(runtime: RuntimeContext, parentSessionID: string, parentDirectory: string): Promise<SessionPromptModel | undefined> {
+  const getSession = runtime.client.session.get?.bind(runtime.client.session)
+  if (!getSession) return undefined
+  const candidates = [parentDirectory, runtime.directory, undefined]
+  for (const directory of candidates) {
+    const input: SessionGetInput = { sessionID: parentSessionID, directory }
+    const result = await getSession(input).catch(() => undefined)
+    const envelopeError = formatSDKEnvelopeError(result)
+    if (envelopeError) continue
+    const model = responseSessionModel(result)
+    if (model) return model
+  }
+  return undefined
+}
+
+function parseModel(input: string): SessionPromptModel | undefined {
   const [providerID, ...rest] = input.split("/")
   const modelID = rest.join("/")
   return providerID && modelID ? { providerID, modelID } : undefined

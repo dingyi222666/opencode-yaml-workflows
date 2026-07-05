@@ -4,7 +4,7 @@ import { parseWorkflowYaml } from "./parser.js"
 import { loadRun, saveWorkflow } from "./persistence.js"
 import { cancelWorkflow, runWorkflow, statusWorkflow } from "./runner.js"
 import { WORKFLOW_SCHEMA_TEXT } from "./schema.js"
-import { responseLastAssistantText, responsePromptText, responseSessionID } from "./sdk-response.js"
+import { responseData, responseLastAssistantText, responsePromptText, responseSessionID, responseSessionModel } from "./sdk-response.js"
 import type { RuntimeContext, ToolRuntimeContext, Workflow } from "./types.js"
 import type { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import type { PermissionRule } from "@opencode-ai/sdk/v2/client"
@@ -13,6 +13,8 @@ type SDKSession = ReturnType<typeof createOpencodeClient>["session"]
 type SessionCreateInput = NonNullable<Parameters<SDKSession["create"]>[0]>
 type SessionMessagesInput = Parameters<SDKSession["messages"]>[0]
 type SessionPromptInput = Parameters<SDKSession["prompt"]>[0]
+type SessionGetInput = Parameters<SDKSession["get"]>[0]
+type SessionPromptModel = NonNullable<SessionPromptInput["model"]>
 
 const z = tool.schema
 const CHILD_TOOL_DENIES: PermissionRule[] = [
@@ -143,7 +145,7 @@ async function resolveWorkflow(runtime: RuntimeContext, context: ToolRuntimeCont
 
 async function generateWorkflow(runtime: RuntimeContext, context: ToolRuntimeContext, args: { goal: string; agent?: string; model?: string; skills?: string[]; tools?: Record<string, boolean>; saveAs?: string }) {
   if (!context.sessionID) throw new Error("workflow_generate requires a current parent sessionID")
-  const model = args.model ? parseModel(args.model) : undefined
+  const model = await resolvePromptModel(runtime, context.sessionID, context.directory, args.model, args.agent)
   const createInput: SessionCreateInput = { parentID: context.sessionID, title: "workflow:generate", directory: context.directory, permission: CHILD_TOOL_DENIES }
   const session = await runtime.client.session.create(createInput)
   const sessionID = responseSessionID(session)
@@ -163,7 +165,29 @@ async function generateWorkflow(runtime: RuntimeContext, context: ToolRuntimeCon
   return { title: `Generated ${workflow.id}`, output: yaml, metadata: { workflowID: workflow.id, sessionID } }
 }
 
-function parseModel(input: string) {
+async function resolvePromptModel(runtime: RuntimeContext, parentSessionID: string, directory: string, explicitModel?: string, agent?: string): Promise<SessionPromptModel | undefined> {
+  const parsed = explicitModel ? parseModel(explicitModel) : undefined
+  if (parsed) return parsed
+  const agentModel = agent ? await resolveAgentModel(runtime, directory, agent) : undefined
+  if (agentModel) return agentModel
+  return resolveParentSessionModel(runtime, parentSessionID, directory)
+}
+
+async function resolveAgentModel(runtime: RuntimeContext, directory: string, agent: string): Promise<SessionPromptModel | undefined> {
+  const agents = await runtime.client.app.agents({ directory }).catch(() => undefined)
+  const list = responseData(agents) ?? []
+  return list.find((item) => item.name === agent)?.model
+}
+
+async function resolveParentSessionModel(runtime: RuntimeContext, parentSessionID: string, directory: string): Promise<SessionPromptModel | undefined> {
+  const getSession = runtime.client.session.get?.bind(runtime.client.session)
+  if (!getSession) return undefined
+  const input: SessionGetInput = { sessionID: parentSessionID, directory }
+  const result = await getSession(input).catch(() => undefined)
+  return responseSessionModel(result)
+}
+
+function parseModel(input: string): SessionPromptModel | undefined {
   const [providerID, ...rest] = input.split("/")
   const modelID = rest.join("/")
   return providerID && modelID ? { providerID, modelID } : undefined

@@ -13,11 +13,12 @@ type TestSessionClient = Partial<Record<keyof OpencodeClient["session"], (...arg
 }
 type TestV2SessionClient = Partial<Record<keyof OpencodeClient["v2"]["session"], (...args: any[]) => any>>
 
-function testRuntime(root: string, session: TestSessionClient, v2Session: TestV2SessionClient = {}): RuntimeContext {
+function testRuntime(root: string, session: TestSessionClient, v2Session: TestV2SessionClient = {}, app: Partial<OpencodeClient["app"]> = {}): RuntimeContext {
   return {
     directory: root,
     worktree: root,
     client: {
+      app: app as RuntimeContext["client"]["app"],
       session: session as RuntimeContext["client"]["session"],
       v2: { session: v2Session as RuntimeContext["client"]["v2"]["session"] } as RuntimeContext["client"]["v2"],
     },
@@ -225,6 +226,65 @@ steps:
     try {
       await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(noToolsYaml), inputs: {}, async: false })
       expect(prompts[0]).toMatchObject({ tools: { workflow: false, task: false } })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("inherits agent model before parent session model when model is omitted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
+    const prompts: unknown[] = []
+    const modelYaml = `
+id: model-inherit
+defaults:
+  agent: reviewer
+steps:
+  - id: one
+    prompt: hello
+`
+    const runtime = testRuntime(
+      root,
+      {
+        get: async () => ({ data: { id: "parent-1", directory: root, model: { providerID: "parent", id: "parent-model" } } }),
+        create: async () => ({ id: "child-1", directory: root }),
+        prompt: async (input) => {
+          prompts.push(input)
+          return { data: { parts: [{ type: "text", text: "ok" }] } }
+        },
+        messages: async () => ({ data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "ok" }] }] }),
+      },
+      {},
+      { agents: async () => ({ data: [{ name: "reviewer", model: { providerID: "agent", modelID: "agent-model" } }] }) } as unknown as Partial<OpencodeClient["app"]>,
+    )
+    try {
+      await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(modelYaml), inputs: {}, async: false })
+      expect(prompts[0]).toMatchObject({ model: { providerID: "agent", modelID: "agent-model" } })
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test("inherits parent session model when model and agent model are omitted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "workflow-run-"))
+    const prompts: unknown[] = []
+    const modelYaml = `
+id: parent-model-inherit
+steps:
+  - id: one
+    prompt: hello
+`
+    const runtime = testRuntime(root, {
+      get: async () => ({ data: { id: "parent-1", directory: root, model: { providerID: "parent", id: "parent-model" } } }),
+      create: async () => ({ id: "child-1", directory: root }),
+      prompt: async (input) => {
+        prompts.push(input)
+        return { data: { parts: [{ type: "text", text: "ok" }] } }
+      },
+      messages: async () => ({ data: [{ info: { role: "assistant" }, parts: [{ type: "text", text: "ok" }] }] }),
+    })
+    try {
+      await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(modelYaml), inputs: {}, async: false })
+      expect(prompts[0]).toMatchObject({ model: { providerID: "parent", modelID: "parent-model" } })
     } finally {
       await rm(root, { recursive: true, force: true })
     }
