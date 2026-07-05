@@ -78,6 +78,7 @@ describe("workflow runner", () => {
         ],
       })
       expect(prompts[0]).toMatchObject({ sessionID: "child-1", directory: root, agent: "general", tools: { bash: false, grep: true } })
+      expect(prompts[0]).toMatchObject({ tools: { workflow: false, task: false } })
       expect(JSON.stringify(prompts[0])).toContain("base")
       expect(JSON.stringify(prompts[0])).toContain("extra")
     } finally {
@@ -223,7 +224,7 @@ steps:
 `
     try {
       await runWorkflow({ runtime, tool: { sessionID: "parent-1", directory: root, worktree: root }, workflow: parseWorkflowYaml(noToolsYaml), inputs: {}, async: false })
-      expect((prompts[0] as { body?: Record<string, unknown> }).body).not.toHaveProperty("tools")
+      expect(prompts[0]).toMatchObject({ tools: { workflow: false, task: false } })
     } finally {
       await rm(root, { recursive: true, force: true })
     }

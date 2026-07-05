@@ -19,6 +19,7 @@ const CHILD_TOOL_DENIES: PermissionRule[] = [
   { permission: "workflow", pattern: "*", action: "deny" },
   { permission: "task", pattern: "*", action: "deny" },
 ]
+const CHILD_DISABLED_TOOLS = { workflow: false, task: false } as const
 
 export function createWorkflowTools(runtime: RuntimeContext) {
   return {
@@ -151,7 +152,7 @@ async function generateWorkflow(runtime: RuntimeContext, context: ToolRuntimeCon
   const promptInput: SessionPromptInput = { sessionID, directory: context.directory, parts: [{ type: "text", text: prompt }] }
   if (args.agent) promptInput.agent = args.agent
   if (model) promptInput.model = model
-  if (args.tools) promptInput.tools = args.tools
+  promptInput.tools = { ...(args.tools ?? {}), ...CHILD_DISABLED_TOOLS }
   const result = await (runtime.client.session.prompt?.(promptInput) ?? Promise.resolve(undefined))
   await runtime.client.v2.session.wait({ sessionID, directory: context.directory }).catch(() => undefined)
   const messagesInput: SessionMessagesInput = { sessionID, directory: context.directory }

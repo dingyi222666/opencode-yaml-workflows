@@ -20,6 +20,7 @@ const CHILD_TOOL_DENIES: PermissionRule[] = [
   { permission: "workflow", pattern: "*", action: "deny" },
   { permission: "task", pattern: "*", action: "deny" },
 ]
+const CHILD_DISABLED_TOOLS = { workflow: false, task: false } as const
 
 const activeRuns = new Map<string, { cancelled: boolean }>()
 
@@ -204,7 +205,7 @@ async function executePromptStep(
   const promptInput: SessionPromptInput = { sessionID, directory: childDirectory, parts: [{ type: "text", text: prompt }] }
   if (settings.agent) promptInput.agent = settings.agent
   if (model) promptInput.model = model
-  if (Object.keys(settings.tools).length > 0) promptInput.tools = settings.tools
+  promptInput.tools = { ...settings.tools, ...CHILD_DISABLED_TOOLS }
   if (settings.system) promptInput.system = settings.system
   logRun(run, "Prompting direct child session", { stepID: step.id, attempt, sessionID })
   const promptResult = await waitForChildPrompt(runtime, run, sessionID, childDirectory, step.id, promptInput)
