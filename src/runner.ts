@@ -3,6 +3,7 @@ import { renderTemplate, resolveStepSettings } from "./parser.js"
 import { responseLastAssistantText, responsePromptText, responseSessionDirectory, responseSessionID } from "./sdk-response.js"
 import type { JsonObject, RuntimeContext, ToolRuntimeContext, Workflow, WorkflowRun, WorkflowStep, WorkflowValue } from "./types.js"
 import type { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import type { PermissionRule } from "@opencode-ai/sdk/v2/client"
 
 type SDKSession = ReturnType<typeof createOpencodeClient>["session"]
 type SessionAbortInput = Parameters<SDKSession["abort"]>[0]
@@ -15,6 +16,10 @@ const CHILD_SESSION_TIMEOUT_MS = 15 * 60 * 1000
 const PARENT_STAGE_NOTIFICATION_TIMEOUT_MS = 5_000
 const STEP_OUTPUT_MAX_ATTEMPTS = 3
 const WAKE_OUTPUT_MAX_STEPS = 3
+const CHILD_TOOL_DENIES: PermissionRule[] = [
+  { permission: "workflow", pattern: "*", action: "deny" },
+  { permission: "task", pattern: "*", action: "deny" },
+]
 
 const activeRuns = new Map<string, { cancelled: boolean }>()
 
@@ -248,6 +253,7 @@ async function createChildSession(
     title,
     directory: parentDirectory,
     agent,
+    permission: CHILD_TOOL_DENIES,
     metadata: { workflowID: workflow.id, runID: run.id, stepID: step.id, parentSessionID: run.parentSessionID },
   }
   logRun(run, "Creating direct child session in parent directory", { stepID: step.id, parentDirectory, createInput })

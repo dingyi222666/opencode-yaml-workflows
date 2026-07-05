@@ -67,7 +67,16 @@ describe("workflow runner", () => {
       const run = await runWorkflow({ runtime, tool, workflow: parseWorkflowYaml(yaml), inputs: { name: "task" }, async: false })
       expect(run.status).toBe("completed")
       expect(creates).toHaveLength(1)
-      expect(creates[0]).toMatchObject({ parentID: "parent-1", title: "workflow:run-me/one", directory: root, agent: "general" })
+      expect(creates[0]).toMatchObject({
+        parentID: "parent-1",
+        title: "workflow:run-me/one",
+        directory: root,
+        agent: "general",
+        permission: [
+          { permission: "workflow", pattern: "*", action: "deny" },
+          { permission: "task", pattern: "*", action: "deny" },
+        ],
+      })
       expect(prompts[0]).toMatchObject({ sessionID: "child-1", directory: root, agent: "general", tools: { bash: false, grep: true } })
       expect(JSON.stringify(prompts[0])).toContain("base")
       expect(JSON.stringify(prompts[0])).toContain("extra")
@@ -109,7 +118,16 @@ describe("workflow runner", () => {
       const run = await runWorkflow({ runtime, tool, workflow: parseWorkflowYaml(yaml), inputs: {} })
       expect(run.async).toBe(true)
       await new Promise((resolve) => setTimeout(resolve, 25))
-      expect(creates[0]).toMatchObject({ parentID: "parent-1", title: "workflow:run-me/one", directory: "/parent/repo", agent: "general" })
+      expect(creates[0]).toMatchObject({
+        parentID: "parent-1",
+        title: "workflow:run-me/one",
+        directory: "/parent/repo",
+        agent: "general",
+        permission: [
+          { permission: "workflow", pattern: "*", action: "deny" },
+          { permission: "task", pattern: "*", action: "deny" },
+        ],
+      })
       expect(prompts[0]).toMatchObject({ sessionID: "child-1", directory: "/parent/repo" })
       expect(JSON.stringify(prompts[0])).toContain(`Target repository directory:\\n${root}`)
       expect(waits).toHaveLength(0)

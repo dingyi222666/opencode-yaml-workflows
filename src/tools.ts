@@ -7,6 +7,7 @@ import { WORKFLOW_SCHEMA_TEXT } from "./schema.js"
 import { responseLastAssistantText, responsePromptText, responseSessionID } from "./sdk-response.js"
 import type { RuntimeContext, ToolRuntimeContext, Workflow } from "./types.js"
 import type { createOpencodeClient } from "@opencode-ai/sdk/v2"
+import type { PermissionRule } from "@opencode-ai/sdk/v2/client"
 
 type SDKSession = ReturnType<typeof createOpencodeClient>["session"]
 type SessionCreateInput = NonNullable<Parameters<SDKSession["create"]>[0]>
@@ -14,6 +15,10 @@ type SessionMessagesInput = Parameters<SDKSession["messages"]>[0]
 type SessionPromptInput = Parameters<SDKSession["prompt"]>[0]
 
 const z = tool.schema
+const CHILD_TOOL_DENIES: PermissionRule[] = [
+  { permission: "workflow", pattern: "*", action: "deny" },
+  { permission: "task", pattern: "*", action: "deny" },
+]
 
 export function createWorkflowTools(runtime: RuntimeContext) {
   return {
@@ -138,7 +143,7 @@ async function resolveWorkflow(runtime: RuntimeContext, context: ToolRuntimeCont
 async function generateWorkflow(runtime: RuntimeContext, context: ToolRuntimeContext, args: { goal: string; agent?: string; model?: string; skills?: string[]; tools?: Record<string, boolean>; saveAs?: string }) {
   if (!context.sessionID) throw new Error("workflow_generate requires a current parent sessionID")
   const model = args.model ? parseModel(args.model) : undefined
-  const createInput: SessionCreateInput = { parentID: context.sessionID, title: "workflow:generate", directory: context.directory }
+  const createInput: SessionCreateInput = { parentID: context.sessionID, title: "workflow:generate", directory: context.directory, permission: CHILD_TOOL_DENIES }
   const session = await runtime.client.session.create(createInput)
   const sessionID = responseSessionID(session)
   if (!sessionID) throw new Error("Failed to create workflow generation child session")
