@@ -11,4 +11,9 @@ export function injectWorkflowCommand(config: Config) {
     template: workflowCommandTemplate(),
   }
 }
+
+export function markWorkflowAsPrimaryTool(config: Config) {
+  config.experimental ??= {}
+  config.experimental.primary_tools = [...new Set([...(config.experimental.primary_tools ?? []), "workflow"])]
+}
 import type { Config } from "@opencode-ai/plugin"

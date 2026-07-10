@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { injectWorkflowCommand, workflowCommandTemplate } from "../src/command.js"
+import { injectWorkflowCommand, markWorkflowAsPrimaryTool, workflowCommandTemplate } from "../src/command.js"
 
 describe("workflow command", () => {
   test("registers /workflow command template", () => {
@@ -11,5 +11,13 @@ describe("workflow command", () => {
     expect(workflowCommandTemplate()).toContain('action="list"')
     expect(workflowCommandTemplate()).toContain('action="generate"')
     expect(workflowCommandTemplate()).toContain('action="run"')
+  })
+
+  test("marks workflow as a primary-only tool for task subagents", () => {
+    const config: { experimental?: { primary_tools?: string[] } } = {
+      experimental: { primary_tools: ["existing", "workflow"] },
+    }
+    markWorkflowAsPrimaryTool(config)
+    expect(config.experimental?.primary_tools).toEqual(["existing", "workflow"])
   })
 })

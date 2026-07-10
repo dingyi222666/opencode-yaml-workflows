@@ -1,9 +1,9 @@
 import type { Plugin, PluginModule } from "@opencode-ai/plugin"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
-import { injectWorkflowCommand } from "./command.js"
+import { injectWorkflowCommand, markWorkflowAsPrimaryTool } from "./command.js"
 import { createWorkflowTools } from "./tools.js"
 
-export { injectWorkflowCommand, workflowCommandTemplate } from "./command.js"
+export { injectWorkflowCommand, markWorkflowAsPrimaryTool, workflowCommandTemplate } from "./command.js"
 export { discoverWorkflows } from "./discovery.js"
 export { parseWorkflowYaml, normalizeWorkflow, renderTemplate, resolveStepSettings, WorkflowValidationError } from "./parser.js"
 export { saveRun, loadRun, saveWorkflow } from "./persistence.js"
@@ -25,6 +25,7 @@ const server: Plugin = async ({ directory, worktree, serverUrl }) => {
     },
     config: async (config) => {
       injectWorkflowCommand(config)
+      markWorkflowAsPrimaryTool(config)
     },
     tool: createWorkflowTools({ client, directory, worktree }),
   }
